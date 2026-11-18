@@ -1,0 +1,24 @@
+[package]
+name = "veyra"
+version = "0.0.11"
+edition = "2024"
+license = "Apache-2.0"
+description = "A focused native desktop media player built with Rust and Rune"
+
+[dependencies]
+libc = "0.2.191"
+rune = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+
+[dev-dependencies]
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+
+
