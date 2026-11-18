@@ -25,6 +25,7 @@ pub(crate) fn run(
                             paused = false;
                             let mut state = snapshot.lock().unwrap();
                             state.paused = false;
+                            state.finished = false;
                             state.error = None;
                             state.position = 0.0;
                             state.duration = duration;
@@ -41,6 +42,11 @@ pub(crate) fn run(
                             state.audio_bitrate = metadata.audio_bitrate;
                             state.video_decoder = metadata.video_decoder;
                             state.audio_output = metadata.audio_output;
+                            state.video_frames_processed = 0;
+                            state.frame_processing_ms = None;
+                            state.frame_processing_avg_ms = None;
+                            state.frame_processing_peak_ms = None;
+                            state.audio_processing_ms = None;
                             state.video_profile = metadata.video_profile;
                             state.video_pixel_format = metadata.video_pixel_format;
                         }
@@ -82,7 +88,16 @@ pub(crate) fn run(
                 .expect("decoder exists")
                 .step(&snapshot, &frame);
             if let Err(error) = result {
-                snapshot.lock().unwrap().error = Some(error);
+                let mut state = snapshot.lock().unwrap();
+                if error == "playback finished" {
+                    state.finished = true;
+                    state.paused = true;
+                    if let Some(duration) = state.duration {
+                        state.position = duration;
+                    }
+                } else {
+                    state.error = Some(error);
+                }
                 decoder = None;
             }
         } else {

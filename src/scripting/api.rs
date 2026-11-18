@@ -34,6 +34,10 @@ pub fn statistics_table(lua: &Lua, stats: &StatisticsSnapshot) -> Result<Table> 
     t.set("container", stats.container.clone())?;
     t.set("file_size", stats.file_size)?;
     t.set("frames_processed", stats.video_frames_processed)?;
+    t.set("frames_rendered", stats.rendered_frames)?;
+    t.set("render_fps", stats.render_fps)?;
+    t.set("frame_interval_ms", stats.frame_interval_ms)?;
+    t.set("frame_jitter_ms", stats.frame_jitter_ms)?;
     t.set("frame_processing_ms", stats.frame_processing_ms)?;
     t.set("frame_processing_avg_ms", stats.frame_processing_avg_ms)?;
     t.set("frame_processing_peak_ms", stats.frame_processing_peak_ms)?;

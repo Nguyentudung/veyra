@@ -309,6 +309,32 @@ fn page(state: &State, kit: &Kit) -> El {
             ))
             .child(row_value(
                 kit,
+                "Frames rendered",
+                s.rendered_frames.to_string(),
+            ))
+            .child(row_value(
+                kit,
+                "Render FPS",
+                s.render_fps
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Frame interval",
+                s.frame_interval_ms
+                    .map(|v| format!("{v:.2} ms"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Frame jitter",
+                s.frame_jitter_ms
+                    .map(|v| format!("{v:.2} ms"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
                 "Processing",
                 s.frame_processing_ms
                     .map(|v| format!("{v:.2} ms"))
@@ -383,6 +409,32 @@ fn page(state: &State, kit: &Kit) -> El {
                 kit,
                 "Frames processed",
                 s.video_frames_processed.to_string(),
+            ))
+            .child(row_value(
+                kit,
+                "Frames rendered",
+                s.rendered_frames.to_string(),
+            ))
+            .child(row_value(
+                kit,
+                "Render FPS",
+                s.render_fps
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Frame interval",
+                s.frame_interval_ms
+                    .map(|v| format!("{v:.2} ms"))
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Frame jitter",
+                s.frame_jitter_ms
+                    .map(|v| format!("{v:.2} ms"))
+                    .unwrap_or_else(|| "—".into()),
             ))
             .child(row_value(
                 kit,

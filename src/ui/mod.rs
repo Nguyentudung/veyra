@@ -36,6 +36,7 @@ pub struct State {
     volume: f64,
     frame_id: u64,
     last_paused: bool,
+    last_finished: bool,
     last_muted: bool,
     last_error: Option<String>,
     last_position: f64,
@@ -71,6 +72,7 @@ impl State {
             volume: 100.0,
             frame_id: 0,
             last_paused: false,
+            last_finished: false,
             last_muted: false,
             last_error: None,
             last_position: 0.0,
@@ -96,6 +98,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     tx.wake_after(Duration::from_millis(16));
     let mut changed = false;
     if let Some(frame) = state.engine.take_latest_frame() {
+        state.collector.record_rendered_frame();
         state.frame_id = state.frame_id.wrapping_add(1);
         let result = state.surface.push_bytes(
             ByteFrame {
@@ -118,6 +121,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         state.playlist.current_track().map(|t| t.path.as_path()),
     );
     if state.last_file_name != snapshot.file_name {
+        state.collector.reset_stream();
         if snapshot.file_name.is_some() {
             let event = if state.last_file_name.is_some() {
                 PlaybackEvent::TrackChanged {
@@ -148,6 +152,11 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             state.statistics.clone(),
         );
     }
+    if state.last_finished != snapshot.finished && snapshot.finished {
+        state
+            .scripts
+            .dispatch(PlaybackEvent::Finished, state.statistics.clone());
+    }
     if state.last_paused != snapshot.paused
         || state.last_muted != snapshot.muted
         || state.last_error != snapshot.error
@@ -155,6 +164,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         || state.last_duration != snapshot.duration
     {
         state.last_paused = snapshot.paused;
+        state.last_finished = snapshot.finished;
         state.last_muted = snapshot.muted;
         state.last_error = snapshot.error.clone();
         state.last_position = snapshot.position;

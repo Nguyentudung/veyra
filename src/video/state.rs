@@ -1,6 +1,7 @@
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub paused: bool,
+    pub finished: bool,
     pub position: f64,
     pub duration: Option<f64>,
     pub volume: f64,

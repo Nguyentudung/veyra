@@ -7,6 +7,14 @@ pub struct StatisticsCollector {
     frame_history: History,
     aggregator: Aggregator,
     last: Instant,
+    last_render: Option<Instant>,
+    render_window: Instant,
+    rendered_frames: u64,
+    render_fps: Option<f64>,
+    frame_interval_ms: Option<f64>,
+    frame_jitter_ms: Option<f64>,
+    previous_frame_interval_ms: Option<f64>,
+    total_rendered_frames: u64,
 }
 
 impl StatisticsCollector {
@@ -16,7 +24,45 @@ impl StatisticsCollector {
             frame_history: History::new(120),
             aggregator: Aggregator::default(),
             last: Instant::now(),
+            last_render: None,
+            render_window: Instant::now(),
+            rendered_frames: 0,
+            render_fps: None,
+            frame_interval_ms: None,
+            frame_jitter_ms: None,
+            previous_frame_interval_ms: None,
+            total_rendered_frames: 0,
         }
+    }
+    pub fn record_rendered_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_render {
+            let interval = now.duration_since(previous).as_secs_f64() * 1000.0;
+            self.frame_interval_ms = Some(interval);
+            self.frame_jitter_ms = self
+                .previous_frame_interval_ms
+                .map(|previous| (interval - previous).abs());
+            self.previous_frame_interval_ms = Some(interval);
+        }
+        self.last_render = Some(now);
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        self.total_rendered_frames = self.total_rendered_frames.saturating_add(1);
+        let elapsed = now.duration_since(self.render_window).as_secs_f64();
+        if elapsed >= 0.5 {
+            self.render_fps = Some(self.rendered_frames as f64 / elapsed);
+            self.rendered_frames = 0;
+            self.render_window = now;
+        }
+    }
+    pub fn reset_stream(&mut self) {
+        self.last_render = None;
+        self.render_window = Instant::now();
+        self.rendered_frames = 0;
+        self.render_fps = None;
+        self.frame_interval_ms = None;
+        self.frame_jitter_ms = None;
+        self.previous_frame_interval_ms = None;
+        self.total_rendered_frames = 0;
     }
     pub fn sample(&mut self, snapshot: &Snapshot, path: Option<&Path>) -> StatisticsSnapshot {
         if self.last.elapsed().as_millis() >= 250 {
@@ -39,7 +85,9 @@ impl StatisticsCollector {
             position: snapshot.position,
             duration: snapshot.duration,
             playback_speed: 1.0,
-            playback_state: if snapshot.error.is_some() {
+            playback_state: if snapshot.finished {
+                "finished"
+            } else if snapshot.error.is_some() {
                 "error"
             } else if snapshot.file_name.is_none() {
                 "idle"
@@ -63,11 +111,16 @@ impl StatisticsCollector {
             audio_bitrate: snapshot.audio_bitrate,
             audio_output: snapshot.audio_output.clone(),
             video_frames_processed: snapshot.video_frames_processed,
+            rendered_frames: self.total_rendered_frames,
+            render_fps: self.render_fps,
+            frame_interval_ms: self.frame_interval_ms,
+            frame_jitter_ms: self.frame_jitter_ms,
             frame_processing_ms: snapshot.frame_processing_ms,
             frame_processing_avg_ms: snapshot.frame_processing_avg_ms,
             frame_processing_peak_ms: snapshot.frame_processing_peak_ms,
             audio_processing_ms: snapshot.audio_processing_ms,
-            dropped_frames: None,
+            dropped_frames: (snapshot.video_frames_processed >= self.total_rendered_frames)
+                .then_some(snapshot.video_frames_processed - self.total_rendered_frames),
             history: self.history.values(),
             frame_history: self.frame_history.values(),
             averages: self.aggregator.averages(),
