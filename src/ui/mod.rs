@@ -11,7 +11,8 @@ use crate::{
 use rune::color::hex;
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{
-    AppSpec, Cx, El, NativeSurface, ScrollSpec, SurfaceFit, Tx, Waker, col, el, icon, row, text,
+    AppSpec, Cx, El, NativeSurface, ScrollSpec, SurfaceFit, TextStyle, Tx, Waker, col, el, icon,
+    row, text,
 };
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, PaletteSeed,
@@ -145,35 +146,49 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
         fg: hex("#f2f4f8").unwrap(),
         accent: hex("#8fb7ff").unwrap(),
     });
-    let root = el()
-        .w_full()
-        .h_full()
-        .fill(kit.c.bg_deep)
-        .child(video_view(state, &kit))
-        .child(title_overlay(state, &kit))
-        .child(top_left_controls(&kit))
-        .child(top_right_controls(state, &kit))
-        .child(if state.controls_visible {
-            controls(state, &kit)
-        } else {
-            el()
-        })
-        .child(timeline(state, &kit))
-        .child(volume_control(state, &kit))
-        .child(if state.playlist_open {
-            playlist_view(state, &kit)
-        } else {
-            el()
-        });
+    let root = if state.frame_id == 0 {
+        // Keep the initial window focused on the empty state. Playback chrome only
+        // becomes useful after a media item has produced its first video frame.
+        el().w_full()
+            .h_full()
+            .fill(kit.c.bg_deep)
+            .child(video_view(state, &kit))
+    } else {
+        el().w_full()
+            .h_full()
+            .fill(kit.c.bg_deep)
+            .child(video_view(state, &kit))
+            .child(title_overlay(state, &kit))
+            .child(top_left_controls(&kit))
+            .child(top_right_controls(state, &kit))
+            .child(if state.controls_visible {
+                controls(state, &kit)
+            } else {
+                el()
+            })
+            .child(timeline(state, &kit))
+            .child(volume_control(state, &kit))
+            .child(if state.playlist_open {
+                playlist_view(state, &kit)
+            } else {
+                el()
+            })
+    };
     let _ = cx;
     rune_kit::root(root, Vec::new())
 }
 
 fn video_view(state: &State, kit: &Kit) -> El {
     let surface = if state.frame_id > 0 {
-        el().key("video-frame")
-            .w_full()
-            .h_full()
+        let snapshot = state.engine.snapshot();
+        let ratio = (snapshot.video_width > 0 && snapshot.video_height > 0)
+            .then_some(snapshot.video_width as f32 / snapshot.video_height as f32);
+        let video = ratio.map_or_else(
+            || el().w_full().h_full(),
+            |ratio| el().w_full().h_full().aspect_fit(ratio),
+        );
+        video
+            .key("video-frame")
             .native_surface(&state.surface, SurfaceFit::Fit)
     } else {
         col()
@@ -184,20 +199,32 @@ fn video_view(state: &State, kit: &Kit) -> El {
             .child(icon(&FOLDER_OPEN, 38.0).color(kit.c.icon_muted))
             .child(
                 text("No media loaded")
-                    .font(kit.ty.ui)
+                    .font(TextStyle {
+                        size: 18.0,
+                        ..kit.ty.ui
+                    })
                     .color(kit.c.text_base),
             )
             .child(
                 text(state.status.clone())
-                    .font(kit.ty.body)
+                    .font(TextStyle {
+                        size: 17.0,
+                        ..kit.ty.body
+                    })
                     .color(kit.c.text_muted),
             )
             .child(
                 Button::new("Open media")
                     .variant(ButtonVariant::Contrast)
                     .on_press(|s: &mut State| open_media(s))
-                    .control_size(ControlSize::Large)
-                    .build(kit),
+                    .control_size(ControlSize::ExtraLarge)
+                    .label_with(|font, ink| {
+                        text("Open media")
+                            .font(TextStyle { size: 18.0, ..font })
+                            .color(ink)
+                    })
+                    .build(kit)
+                    .radius(999.0),
             )
     };
     el().key("video-viewport")
@@ -220,9 +247,10 @@ fn title_overlay(state: &State, kit: &Kit) -> El {
         .child(
             row()
                 .max_w(620.0)
+                .shrink()
                 .px(20.0)
                 .py(12.0)
-                .radius(18.0)
+                .radius(999.0)
                 .backdrop_blur(10.0)
                 .fill(hex("#090b1080").unwrap())
                 .child(
@@ -308,7 +336,9 @@ fn volume_control(state: &State, kit: &Kit) -> El {
         el()
     };
     col()
-        .pin(None, None, Some(24.0), Some(30.0))
+        // The mute capsule is 44 px tall while the playback capsule is 52 px tall.
+        // Align their centers by giving the shorter capsule 8 px more bottom inset.
+        .pin(None, None, Some(24.0), Some(38.0))
         .gap(8.0)
         .center()
         .on_hover_change(|s: &mut State, inside, _| s.volume_hovered = inside)
@@ -485,9 +515,10 @@ fn timeline(state: &State, kit: &Kit) -> El {
             (snapshot.position / duration).clamp(0.0, 1.0) as f32
         });
     let duration_for_drag = snapshot.duration.filter(|duration| *duration > 0.0);
-    let timeline_width = 680.0;
-    let seek = el()
-        .w(timeline_width)
+    let seek = row()
+        .w_frac(0.84)
+        .min_w(120.0)
+        .max_w(680.0)
         .h(16.0)
         .on_drag(move |s: &mut State, drag, _| {
             if let Some(duration) = duration_for_drag {
@@ -500,25 +531,30 @@ fn timeline(state: &State, kit: &Kit) -> El {
         })
         .child(
             el().absolute(0.0, 5.0)
-                .w(timeline_width)
+                .w_full()
                 .h(6.0)
                 .radius(3.0)
                 .fill(hex("#ffffff26").unwrap()),
         )
         .child(
-            el().absolute(0.0, 5.0)
-                .w((timeline_width * progress).max(1.0))
-                .h(6.0)
-                .radius(3.0)
-                .fill(kit.c.bg_accent),
+            el().grow(progress.max(0.001))
+                .h(16.0)
+                .child(
+                    el().absolute(0.0, 5.0)
+                        .w_full()
+                        .h(6.0)
+                        .radius(3.0)
+                        .fill(kit.c.bg_accent),
+                )
+                .child(
+                    el().pin(None, Some(2.0), Some(-6.0), None)
+                        .w(12.0)
+                        .h(12.0)
+                        .radius(999.0)
+                        .fill(hex("#ffffff").unwrap()),
+                ),
         )
-        .child(
-            el().absolute(timeline_width * progress - 6.0, 2.0)
-                .w(12.0)
-                .h(12.0)
-                .radius(999.0)
-                .fill(hex("#ffffff").unwrap()),
-        );
+        .child(el().grow((1.0 - progress).max(0.001)).h(16.0));
     col()
         .pin(Some(0.0), None, Some(0.0), Some(92.0))
         .w_full()
@@ -527,7 +563,9 @@ fn timeline(state: &State, kit: &Kit) -> El {
         .child(seek)
         .child(
             row()
-                .w(680.0)
+                .w_frac(0.84)
+                .min_w(120.0)
+                .max_w(680.0)
                 .justify_between()
                 .child(
                     text(format_time(snapshot.position))
