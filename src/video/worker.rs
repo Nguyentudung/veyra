@@ -20,6 +20,7 @@ pub(crate) fn run(
                     match Decoder::open(&path) {
                         Ok(new_decoder) => {
                             let duration = new_decoder.duration();
+                            let metadata = new_decoder.metadata();
                             decoder = Some(new_decoder);
                             paused = false;
                             let mut state = snapshot.lock().unwrap();
@@ -27,6 +28,21 @@ pub(crate) fn run(
                             state.error = None;
                             state.position = 0.0;
                             state.duration = duration;
+                            state.file_name = metadata.file_name;
+                            state.file_path = metadata.file_path;
+                            state.container = metadata.container;
+                            state.file_size = metadata.file_size;
+                            state.video_codec = metadata.video_codec;
+                            state.audio_codec = metadata.audio_codec;
+                            state.audio_sample_rate = metadata.audio_sample_rate;
+                            state.audio_channels = metadata.audio_channels;
+                            state.video_fps = metadata.video_fps;
+                            state.video_bitrate = metadata.video_bitrate;
+                            state.audio_bitrate = metadata.audio_bitrate;
+                            state.video_decoder = metadata.video_decoder;
+                            state.audio_output = metadata.audio_output;
+                            state.video_profile = metadata.video_profile;
+                            state.video_pixel_format = metadata.video_pixel_format;
                         }
                         Err(error) => snapshot.lock().unwrap().error = Some(error),
                     }

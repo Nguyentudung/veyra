@@ -19,6 +19,7 @@ pub(crate) struct Decoder {
     audio_output: Option<AudioOutput>,
     renderer: super::rendering::SoftwareRenderer,
     presentation_clock: rendering::PresentationClock,
+    initial_state: Snapshot,
 }
 
 unsafe impl Send for Decoder {}
@@ -36,6 +37,34 @@ impl Decoder {
             if frame.is_null() {
                 return Err("could not allocate decoder frame".into());
             }
+            let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+            let mut state = Snapshot::default();
+            state.file_name = path.file_name().and_then(|v| v.to_str()).map(str::to_owned);
+            state.file_path = Some(path.display().to_string());
+            state.container = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .map(|v| v.to_ascii_lowercase());
+            state.file_size = file_size;
+            if let Some(video) = video.as_ref() {
+                state.video_codec = codec_name(video.context);
+                state.video_fps = video.frame_rate;
+                state.video_bitrate =
+                    ((*video.context).bit_rate > 0).then_some((*video.context).bit_rate as u64);
+                state.video_profile = codec_profile(video.context);
+                state.video_pixel_format = pixel_format(video.context);
+                state.video_decoder = Some("FFmpeg software decoder".into());
+            }
+            if let Some(audio) = audio.as_ref() {
+                state.audio_codec = codec_name(audio.context);
+                state.audio_sample_rate = ((*audio.context).sample_rate > 0)
+                    .then_some((*audio.context).sample_rate as u32);
+                state.audio_channels = ((*audio.context).ch_layout.nb_channels > 0)
+                    .then_some((*audio.context).ch_layout.nb_channels as u32);
+                state.audio_bitrate =
+                    ((*audio.context).bit_rate > 0).then_some((*audio.context).bit_rate as u64);
+                state.audio_output = Some("ALSA default".into());
+            }
             Ok(Self {
                 demuxer,
                 audio,
@@ -44,8 +73,13 @@ impl Decoder {
                 audio_output: None,
                 renderer: super::rendering::SoftwareRenderer::new(),
                 presentation_clock: rendering::PresentationClock::new(),
+                initial_state: state,
             })
         }
+    }
+
+    pub(crate) fn metadata(&self) -> Snapshot {
+        self.initial_state.clone()
     }
 
     pub(crate) fn step(
@@ -137,6 +171,21 @@ impl Decoder {
                 .then_some((*self.demuxer.format).duration as f64 / 1_000_000.0)
         }
     }
+}
+
+fn codec_name(context: *mut super::ffi::AVCodecContext) -> Option<String> {
+    unsafe {
+        let ptr = super::ffi::avcodec_get_name((*context).codec_id);
+        (!ptr.is_null()).then(|| std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+fn codec_profile(context: *mut super::ffi::AVCodecContext) -> Option<String> {
+    unsafe { ((*context).profile >= 0).then_some((*context).profile.to_string()) }
+}
+
+fn pixel_format(context: *mut super::ffi::AVCodecContext) -> Option<String> {
+    unsafe { ((*context).pix_fmt >= 0).then_some(format!("pixel format {}", (*context).pix_fmt)) }
 }
 
 impl Drop for Decoder {

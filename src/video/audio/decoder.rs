@@ -2,7 +2,10 @@ use super::{
     super::{ffi, state::Snapshot},
     output::AudioOutput,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 pub(crate) unsafe fn decode_audio(
     context: *mut ffi::AVCodecContext,
@@ -16,6 +19,7 @@ pub(crate) unsafe fn decode_audio(
         "send audio packet",
     )?;
     while ffi::avcodec_receive_frame(context, frame) >= 0 {
+        let processing_started = Instant::now();
         if output.is_none() {
             *output = Some(AudioOutput::open(
                 (*frame).sample_rate,
@@ -36,6 +40,8 @@ pub(crate) unsafe fn decode_audio(
         if count > 0 {
             apply_volume(&mut samples, count, snapshot);
             audio.write(&samples, count as u64)?;
+            snapshot.lock().unwrap().audio_processing_ms =
+                Some(processing_started.elapsed().as_secs_f64() * 1000.0);
         }
     }
     Ok(())

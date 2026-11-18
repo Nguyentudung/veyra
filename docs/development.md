@@ -8,6 +8,7 @@ On Ubuntu install:
 sudo apt install ffmpeg libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev libasound2-dev zenity clang libclang-dev
 cargo run
 cargo test --offline
+cargo build --release
 ```
 
 `build.rs` reads `wrapper.h`, generates bindings with bindgen, and links FFmpeg/ALSA libraries. Rune and Rune Kit are pinned git dependencies; the patch entries mirror Rune's own workspace patches so the app uses the same native integration crates.

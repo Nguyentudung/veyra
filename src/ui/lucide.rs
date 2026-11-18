@@ -56,9 +56,13 @@ pub static FULLSCREEN: Icon = lucide!(
     "lucide-fullscreen",
     r#"<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><rect width="10" height="8" x="7" y="8" rx="1"/>"#
 );
-pub static LIST: Icon = lucide!(
-    "lucide-list",
-    r#"<path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/>"#
+pub static INFO: Icon = lucide!(
+    "lucide-info",
+    r#"<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>"#
+);
+pub static TEXT_ALIGN_JUSTIFY: Icon = lucide!(
+    "hugeicons-text-align-justify",
+    r#"<path d="M4 6h16M4 10h16M4 14h16M4 18h16"/>"#
 );
 pub static FOLDER_OPEN: Icon = lucide!(
     "lucide-folder-open",

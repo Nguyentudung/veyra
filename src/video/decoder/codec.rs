@@ -4,6 +4,7 @@ pub(crate) struct Codec {
     pub(crate) context: *mut ffi::AVCodecContext,
     pub(crate) stream_index: i32,
     pub(crate) time_base: ffi::AVRational,
+    pub(crate) frame_rate: Option<f64>,
 }
 
 pub(crate) unsafe fn open(
@@ -32,6 +33,8 @@ pub(crate) unsafe fn open(
         context,
         stream_index: index,
         time_base: (*stream).time_base,
+        frame_rate: ((*stream).avg_frame_rate.den > 0 && (*stream).avg_frame_rate.num > 0)
+            .then_some((*stream).avg_frame_rate.num as f64 / (*stream).avg_frame_rate.den as f64),
     }))
 }
 

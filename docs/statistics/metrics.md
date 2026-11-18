@@ -1,0 +1,3 @@
+# Metrics
+
+Implemented metrics are file name/path, container extension, file size, position, duration, remaining time, playback state, playback speed (the engine's fixed normal speed), video codec/profile/pixel format, resolution, stream FPS, codec bitrate where FFmpeg exposes it, decoder implementation, audio codec/bitrate/sample rate/channels, ALSA output, video frames processed, current/average/peak software conversion time, and audio processing time. Frame processing history is bounded to 120 samples and exposed to Lua. Dropped frames, packet queues, buffering, GPU timing, color metadata, and all-stream enumeration remain unavailable because the current engine does not measure or expose them.

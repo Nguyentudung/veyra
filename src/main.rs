@@ -1,6 +1,8 @@
 mod app;
 mod playback;
 mod playlist;
+mod scripting;
+mod statistics;
 mod ui;
 mod utils;
 mod video;

@@ -50,7 +50,9 @@ pub(crate) unsafe fn decode_video(
         "send video packet",
     )?;
     while ffi::avcodec_receive_frame(context, frame) >= 0 {
+        let processing_started = Instant::now();
         let (rgba, width, height) = renderer.convert(frame)?;
+        let processing_ms = processing_started.elapsed().as_secs_f64() * 1000.0;
         let timestamp = timestamp_seconds(frame, time_base);
         clock.wait_until(timestamp);
         *output.lock().unwrap() = Some(VideoFrame {
@@ -58,7 +60,19 @@ pub(crate) unsafe fn decode_video(
             width,
             height,
         });
-        snapshot.lock().unwrap().position = timestamp;
+        let mut state = snapshot.lock().unwrap();
+        state.position = timestamp;
+        state.video_frames_processed = state.video_frames_processed.saturating_add(1);
+        state.frame_processing_ms = Some(processing_ms);
+        state.frame_processing_peak_ms = Some(
+            state
+                .frame_processing_peak_ms
+                .unwrap_or(0.0)
+                .max(processing_ms),
+        );
+        let count = state.video_frames_processed as f64;
+        let previous = state.frame_processing_avg_ms.unwrap_or(processing_ms);
+        state.frame_processing_avg_ms = Some(previous + (processing_ms - previous) / count);
     }
     Ok(())
 }

@@ -1,26 +1,32 @@
 use self::lucide::{
-    FAST_FORWARD, FOLDER_OPEN, FULLSCREEN, LIST, PAUSE, PLAY, REWIND, SKIP_BACK, SKIP_FORWARD,
-    VOLUME_2, VOLUME_X, X,
+    FAST_FORWARD, FOLDER_OPEN, PAUSE, PLAY, REWIND, SKIP_BACK, SKIP_FORWARD, VOLUME_2, VOLUME_X,
 };
-use self::styles::glass_capsule;
+use self::theme::glass_capsule;
 use crate::utils::format_time;
 use crate::{
     playback::Engine,
     playlist::{Playlist, is_probably_media},
+    scripting::{PlaybackEvent, ScriptManager},
+    statistics::{StatisticsCollector, StatisticsSnapshot},
 };
 use rune::color::hex;
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{
-    AppSpec, Cx, El, NativeSurface, ScrollSpec, SurfaceFit, TextStyle, Tx, Waker, col, el, icon,
-    row, text,
+    AppSpec, Cx, El, NativeSurface, SurfaceFit, TextStyle, Tx, Waker, col, el, icon, row, text,
 };
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, PaletteSeed,
 };
 use std::{path::PathBuf, process::Command, time::Duration};
 
+mod component_impl;
 mod lucide;
-mod styles;
+mod options_menu;
+mod playback_controls;
+mod statistics_panel;
+mod theme;
+mod titlebar;
+mod top_bar;
 
 pub struct State {
     engine: Engine,
@@ -34,9 +40,15 @@ pub struct State {
     last_error: Option<String>,
     last_position: f64,
     last_duration: Option<f64>,
-    playlist_open: bool,
     controls_visible: bool,
     volume_hovered: bool,
+    statistics_open: bool,
+    collector: StatisticsCollector,
+    statistics: StatisticsSnapshot,
+    scripts: ScriptManager,
+    last_file_name: Option<String>,
+    statistics_page: usize,
+    options_open: bool,
 }
 
 pub fn run() {
@@ -63,9 +75,15 @@ impl State {
             last_error: None,
             last_position: 0.0,
             last_duration: None,
-            playlist_open: false,
             controls_visible: true,
             volume_hovered: false,
+            statistics_open: false,
+            collector: StatisticsCollector::new(),
+            statistics: StatisticsSnapshot::default(),
+            scripts: ScriptManager::new(StatisticsSnapshot::default()),
+            last_file_name: None,
+            statistics_page: 0,
+            options_open: false,
         }
     }
 }
@@ -95,6 +113,41 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         changed = true;
     }
     let snapshot = state.engine.snapshot();
+    state.statistics = state.collector.sample(
+        &snapshot,
+        state.playlist.current_track().map(|t| t.path.as_path()),
+    );
+    if state.last_file_name != snapshot.file_name {
+        if snapshot.file_name.is_some() {
+            let event = if state.last_file_name.is_some() {
+                PlaybackEvent::TrackChanged {
+                    file_name: snapshot.file_name.clone(),
+                }
+            } else {
+                PlaybackEvent::Started
+            };
+            state.scripts.dispatch(event, state.statistics.clone());
+        }
+        state.last_file_name = snapshot.file_name.clone();
+    }
+    if (snapshot.position - state.last_position).abs() > 1.0 && snapshot.file_name.is_some() {
+        state.scripts.dispatch(
+            PlaybackEvent::Seeked {
+                position: snapshot.position,
+            },
+            state.statistics.clone(),
+        );
+    }
+    if state.last_paused != snapshot.paused && snapshot.file_name.is_some() {
+        state.scripts.dispatch(
+            if snapshot.paused {
+                PlaybackEvent::Paused
+            } else {
+                PlaybackEvent::Resumed
+            },
+            state.statistics.clone(),
+        );
+    }
     if state.last_paused != snapshot.paused
         || state.last_muted != snapshot.muted
         || state.last_error != snapshot.error
@@ -136,6 +189,11 @@ fn on_key(state: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
             state.engine.toggle_mute();
             true
         }
+        rune::Key::Text(value) if value.eq_ignore_ascii_case("r") => {
+            state.scripts.reload();
+            state.status = "Tools reloaded".into();
+            true
+        }
         _ => false,
     }
 }
@@ -158,21 +216,26 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .h_full()
             .fill(kit.c.bg_deep)
             .child(video_view(state, &kit))
-            .child(title_overlay(state, &kit))
-            .child(top_left_controls(&kit))
-            .child(top_right_controls(state, &kit))
+            .child(top_bar::view(state, &kit))
             .child(if state.controls_visible {
-                controls(state, &kit)
+                playback_controls::transport(state, &kit)
             } else {
                 el()
             })
-            .child(timeline(state, &kit))
-            .child(volume_control(state, &kit))
-            .child(if state.playlist_open {
-                playlist_view(state, &kit)
+            .child(playback_controls::scrubber(state, &kit))
+            .child(playback_controls::volume(state, &kit))
+            .child(if state.statistics_open {
+                statistics_panel::view(state, &kit)
             } else {
                 el()
             })
+            .child(options_menu::trigger(state, &kit))
+            .child(if state.options_open {
+                options_menu::view(state, &kit)
+            } else {
+                el()
+            })
+            .child(titlebar::overlay(state, &kit, cx))
     };
     let _ = cx;
     rune_kit::root(root, Vec::new())
@@ -234,66 +297,6 @@ fn video_view(state: &State, kit: &Kit) -> El {
         .child(surface)
 }
 
-fn title_overlay(state: &State, kit: &Kit) -> El {
-    let title = state
-        .playlist
-        .current_index()
-        .and_then(|index| state.playlist.tracks().get(index))
-        .map(|track| track.title.clone())
-        .unwrap_or_else(|| "Veyra".into());
-    row()
-        .pin(Some(0.0), Some(18.0), Some(0.0), None)
-        .center()
-        .child(
-            row()
-                .max_w(620.0)
-                .shrink()
-                .px(20.0)
-                .py(12.0)
-                .radius(999.0)
-                .backdrop_blur(10.0)
-                .fill(hex("#090b1080").unwrap())
-                .child(
-                    text(title)
-                        .font(kit.ty.ui)
-                        .color(kit.c.text_base)
-                        .truncate(),
-                ),
-        )
-}
-
-fn top_left_controls(kit: &Kit) -> El {
-    row()
-        .pin(Some(22.0), Some(22.0), None, None)
-        .child(glass_capsule(
-            IconButton::new(&FULLSCREEN)
-                .label("Fullscreen")
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Large)
-                .on_press_tx(|_: &mut State, tx| tx.toggle_full_screen())
-                .build(kit)
-                .radius(999.0),
-        ))
-}
-
-fn top_right_controls(state: &State, kit: &Kit) -> El {
-    row()
-        .pin(None, Some(22.0), Some(22.0), None)
-        .child(glass_capsule(
-            IconButton::new(&LIST)
-                .label(if state.playlist_open {
-                    "Hide playlist"
-                } else {
-                    "Show playlist"
-                })
-                .variant(IconButtonVariant::GhostMuted)
-                .control_size(ControlSize::Large)
-                .on_press(|s: &mut State| s.playlist_open = !s.playlist_open)
-                .build(kit)
-                .radius(999.0),
-        ))
-}
-
 fn volume_control(state: &State, kit: &Kit) -> El {
     let slider = if state.volume_hovered {
         let level = (state.volume / 100.0).clamp(0.0, 1.0) as f32;
@@ -329,7 +332,7 @@ fn volume_control(state: &State, kit: &Kit) -> El {
                             .h(16.0)
                             .absolute(-5.0, (104.0 - 16.0) * (1.0 - level))
                             .radius(999.0)
-                            .fill(kit.c.bg_accent),
+                            .fill(hex("#ffffff").unwrap()),
                     ),
             )
     } else {
@@ -360,81 +363,6 @@ fn volume_control(state: &State, kit: &Kit) -> El {
             .build(kit)
             .radius(999.0),
         ))
-}
-
-fn playlist_view(state: &State, kit: &Kit) -> El {
-    let rows = state
-        .playlist
-        .tracks()
-        .iter()
-        .enumerate()
-        .map(|(index, track)| {
-            let active = state.playlist.current_index() == Some(index);
-            let variant = if active {
-                ButtonVariant::Contrast
-            } else {
-                ButtonVariant::GhostMuted
-            };
-            Button::new(track.title.clone())
-                .variant(variant)
-                .help(track.path.display().to_string())
-                .control_size(ControlSize::Large)
-                .on_press(move |s: &mut State| open_track(s, index))
-                .build(kit)
-        });
-    let list = if state.playlist.is_empty() {
-        col().grow(1.0).min_h(0.0).center().child(
-            text("Your playlist is empty")
-                .font(kit.ty.small)
-                .color(kit.c.text_muted),
-        )
-    } else {
-        col()
-            .key("playlist-scroll")
-            .grow(1.0)
-            .min_h(0.0)
-            .gap(6.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .children(rows)
-    };
-    col()
-        .key("playlist-overlay")
-        .w(360.0)
-        .h(500.0)
-        .pin(None, Some(22.0), Some(22.0), None)
-        .px(18.0)
-        .py(20.0)
-        .gap(16.0)
-        .radius(20.0)
-        .backdrop_blur(14.0)
-        .fill(hex("#11141b9c").unwrap())
-        .child(
-            row()
-                .w_full()
-                .justify_between()
-                .child(text("Playlist").font(kit.ty.ui).color(kit.c.text_base))
-                .child(
-                    row()
-                        .gap(8.0)
-                        .center()
-                        .child(
-                            text(state.playlist.tracks().len().to_string())
-                                .font(kit.ty.small)
-                                .color(kit.c.text_faint),
-                        )
-                        .child(
-                            IconButton::new(&X)
-                                .label("Close playlist")
-                                .variant(IconButtonVariant::GhostMuted)
-                                .on_press(|s: &mut State| s.playlist_open = false)
-                                .build(kit)
-                                .radius(999.0),
-                        ),
-                ),
-        )
-        .child(list)
 }
 
 fn controls(state: &State, kit: &Kit) -> El {
