@@ -3633,13 +3633,71 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veyra"
+version = "0.0.18"
+dependencies = [
+ "veyra-app",
+]
+
+[[package]]
+name = "veyra-app"
+version = "0.0.17"
+dependencies = [
+ "veyra-ui",
+]
+
+[[package]]
+name = "veyra-cache"
+version = "0.0.17"
+
+[[package]]
+name = "veyra-playback"
+version = "0.0.17"
+dependencies = [
+ "veyra-video",
+]
+
+[[package]]
+name = "veyra-playlist"
+version = "0.0.17"
+
+[[package]]
+name = "veyra-scripting"
+version = "0.0.17"
+dependencies = [
+ "mlua",
+ "veyra-statistics",
+]
+
+[[package]]
+name = "veyra-statistics"
+version = "0.0.17"
+dependencies = [
+ "veyra-video",
+]
+
+[[package]]
+name = "veyra-ui"
+version = "0.0.17"
+dependencies = [
+ "rune",
+ "rune-kit",
+ "veyra-playback",
+ "veyra-playlist",
+ "veyra-scripting",
+ "veyra-statistics",
+ "veyra-utils",
+]
+
+[[package]]
+name = "veyra-utils"
+version = "0.0.17"
+
+[[package]]
+name = "veyra-video"
 version = "0.0.17"
 dependencies = [
  "bindgen",
- "libc",
- "mlua",
- "rune",
- "rune-kit",
+ "veyra-cache",
 ]
 
 [[package]]

@@ -2,7 +2,17 @@
 
 Detailed technical documentation is organized in [docs/architecture.md](docs/architecture.md), [docs/playback.md](docs/playback.md), [docs/ui.md](docs/ui.md), [docs/platforms.md](docs/platforms.md), [docs/development.md](docs/development.md), and [docs/roadmap.md](docs/roadmap.md).
 
-Veyra is a native desktop media player written in Rust with Rune and Rune Kit. Its playback worker owns demuxing, decoding, software conversion, audio output, frame delivery, and resource cleanup.
+Veyra is a native desktop media player written in Rust with Rune and Rune Kit. The repository is a Cargo workspace: each domain is an independent crate with its own `src/` and `Cargo.toml`.
+
+The main crates are:
+
+- `app` — application bootstrap.
+- `ui` — Rune UI and overlay composition.
+- `playback` — engine façade and worker orchestration.
+- `video` — FFmpeg/ALSA demuxing, decoding, rendering, and audio output.
+- `statistics` and `scripting` — playback metrics and Lua tools.
+- `playlist` and `utils` — reusable application helpers.
+- `cache` — bounded memory reservations used by media queues.
 
 ## Features
 
@@ -24,7 +34,7 @@ sudo apt install ffmpeg libavformat-dev libavcodec-dev libavutil-dev libswscale-
 cargo run
 ```
 
-Run tests with `cargo test`.
+Run the workspace with `cargo run` and test all crates with `cargo test --workspace`.
 
 ## Architecture and research
 
@@ -40,6 +50,10 @@ VLC, FFmpeg, Symphonia, and GStreamer source were evaluated for separation of in
 - ALSA library: LGPL-2.1-or-later.
 - `bindgen`: build-time dependency used for generated FFmpeg/ALSA FFI.
 - Veyra links to system shared libraries and does not ship codec binaries.
+
+## Memory management
+
+`cache` provides an RAII `MemoryBudget`. The audio queue uses an 8 MiB budget in addition to its two-second frame limit, so queued samples cannot grow without bound. Reservations are released when queued chunks are dropped or played. This limits application-owned media buffers; the RSS reported by the OS also includes Rune, FFmpeg codec contexts, ALSA buffers, shared libraries, and allocator overhead, which a cache cannot reclaim while those components are active.
 
 ## Current limitations
 

@@ -1,0 +1,8 @@
+[package]
+name = "veyra-cache"
+version = "0.0.17"
+edition = "2024"
+license = "Apache-2.0"
+description = "Bounded memory and cache primitives for Veyra"
+
+[dependencies]
