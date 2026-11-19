@@ -11,7 +11,7 @@ use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, PaletteSeed,
 };
 use std::{path::PathBuf, process::Command, time::Duration};
-use veyra_playback::Engine;
+use veyra_playback::{Engine, VideoFrame};
 use veyra_playlist::{Playlist, is_probably_media};
 use veyra_scripting::{PlaybackEvent, ScriptManager};
 use veyra_statistics::{StatisticsCollector, StatisticsSnapshot};
@@ -48,6 +48,7 @@ pub struct State {
     last_file_name: Option<String>,
     statistics_page: usize,
     options_open: bool,
+    gpu_generation: Option<u64>,
 }
 
 pub fn run() {
@@ -84,6 +85,7 @@ impl State {
             last_file_name: None,
             statistics_page: 0,
             options_open: false,
+            gpu_generation: None,
         }
     }
 }
@@ -98,19 +100,36 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     // a 60 Hz timer; input and surface wakers still redraw immediately.
     tx.wake_after(Duration::from_millis(33));
     let mut changed = false;
+    if let Some(context) = state.surface.gpu_context() {
+        if state.gpu_generation != Some(context.generation) {
+            state.engine.set_gpu_context(context.clone());
+            state.gpu_generation = Some(context.generation);
+        }
+    }
     if let Some(frame) = state.engine.take_latest_frame() {
         state.collector.record_rendered_frame();
         state.frame_id = state.frame_id.wrapping_add(1);
-        let result = state.surface.push_bytes(
-            ByteFrame {
-                width: frame.width,
-                height: frame.height,
-                format: Format::Bgra,
-                color: ColorInfo::default(),
-                planes: [frame.rgba, Vec::new()],
-            },
-            state.frame_id,
-        );
+        let result = match frame {
+            VideoFrame::Bytes {
+                rgba,
+                width,
+                height,
+                ..
+            } => state.surface.push_bytes(
+                ByteFrame {
+                    width,
+                    height,
+                    format: Format::Bgra,
+                    color: ColorInfo::default(),
+                    planes: [rgba, Vec::new()],
+                },
+                state.frame_id,
+            ),
+            VideoFrame::Gpu { frame, .. } => state.surface.push_gpu(frame, state.frame_id),
+            VideoFrame::GpuVideo { frame, .. } => {
+                state.surface.push_gpu_video(frame, state.frame_id)
+            }
+        };
         if let Err(error) = result {
             state.status = error;
         }

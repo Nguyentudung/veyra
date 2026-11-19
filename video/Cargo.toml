@@ -1,6 +1,6 @@
 [package]
 name = "veyra-video"
-version = "0.0.17"
+version = "0.0.20"
 edition = "2024"
 license = "Apache-2.0"
 description = "FFmpeg, ALSA, decoding and video presentation for Veyra"
@@ -10,6 +10,9 @@ veyra-cache = { path = "../cache" }
 pollster = "1.0.2"
 bytemuck = "1.24.0"
 wgpu = { version = "30.0.2", default-features = false, features = ["vulkan", "glsl", "wgsl"] }
+# Only gpu-native uses these re-exported wgpu types; the readback renderer
+# deliberately keeps its independent Vulkan device for compatibility.
+rune = { path = "../../rune/crates/rune" }
 
 [build-dependencies]
 bindgen = "0.72.1"

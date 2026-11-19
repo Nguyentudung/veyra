@@ -25,7 +25,10 @@ pub(crate) struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    pub(crate) fn open(path: &std::path::Path) -> Result<Self, String> {
+    pub(crate) fn open(
+        path: &std::path::Path,
+        gpu_context: Option<&crate::GpuContext>,
+    ) -> Result<Self, String> {
         unsafe {
             let demuxer = Demuxer::open(path)?;
             let audio = codec::open(demuxer.format, 1)?;
@@ -65,13 +68,17 @@ impl Decoder {
                     ((*audio.context).bit_rate > 0).then_some((*audio.context).bit_rate as u64);
                 state.audio_output = Some("ALSA default".into());
             }
+            let mut renderer = super::rendering::VideoRenderer::new();
+            if let Some(context) = gpu_context {
+                renderer.set_gpu_context(context.clone());
+            }
             Ok(Self {
                 demuxer,
                 audio,
                 video,
                 frame,
                 audio_output: None,
-                renderer: super::rendering::VideoRenderer::new(),
+                renderer,
                 presentation_clock: rendering::PresentationClock::new(),
                 initial_state: state,
             })
@@ -84,6 +91,10 @@ impl Decoder {
 
     pub(crate) fn reset_presentation_clock(&mut self) {
         self.presentation_clock.reset();
+    }
+
+    pub(crate) fn set_gpu_context(&mut self, context: crate::GpuContext) {
+        self.renderer.set_gpu_context(context);
     }
 
     pub(crate) fn pause_audio(&mut self) {

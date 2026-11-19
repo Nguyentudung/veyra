@@ -2737,7 +2737,6 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2794,7 +2793,7 @@ dependencies = [
  "swash",
  "symphonia",
  "taffy",
- "tiny-skia-path 0.11.4 (git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6)",
+ "tiny-skia-path 0.11.4",
  "tokio",
  "unicode-segmentation",
  "wasm-bindgen",
@@ -2822,7 +2821,6 @@ dependencies = [
 [[package]]
 name = "rune-highlights"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "unicode-ident",
  "wasmparser",
@@ -2831,7 +2829,6 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "icu_normalizer",
  "rune",
@@ -2843,12 +2840,10 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "wgpu",
 ]
@@ -2856,7 +2851,6 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "taffy",
 ]
@@ -3430,8 +3424,6 @@ dependencies = [
 [[package]]
 name = "tiny-skia-path"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -3441,7 +3433,8 @@ dependencies = [
 [[package]]
 name = "tiny-skia-path"
 version = "0.11.4"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -3649,7 +3642,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veyra"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "veyra-app",
 ]
@@ -3667,7 +3660,7 @@ version = "0.0.17"
 
 [[package]]
 name = "veyra-playback"
-version = "0.0.17"
+version = "0.0.20"
 dependencies = [
  "veyra-video",
 ]
@@ -3693,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "veyra-ui"
-version = "0.0.17"
+version = "0.0.20"
 dependencies = [
  "rune",
  "rune-kit",
@@ -3710,11 +3703,12 @@ version = "0.0.17"
 
 [[package]]
 name = "veyra-video"
-version = "0.0.17"
+version = "0.0.20"
 dependencies = [
  "bindgen",
  "bytemuck",
  "pollster",
+ "rune",
  "veyra-cache",
  "wgpu",
 ]

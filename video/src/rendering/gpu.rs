@@ -374,7 +374,7 @@ impl GpuRenderer {
             }
             self.last_readback_latency_ms = submitted_at.elapsed().as_secs_f64() * 1000.0;
             self.completed_frames = self.completed_frames.saturating_add(1);
-            newest = Some(VideoFrame {
+            newest = Some(VideoFrame::Bytes {
                 rgba,
                 width,
                 height,

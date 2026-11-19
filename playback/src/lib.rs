@@ -7,9 +7,9 @@ use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
-use veyra_video::Command;
 pub use veyra_video::Snapshot;
-pub(crate) use veyra_video::VideoFrame;
+pub use veyra_video::VideoFrame;
+use veyra_video::{Command, GpuContext};
 
 pub struct Engine {
     tx: mpsc::Sender<Command>,
@@ -62,6 +62,11 @@ impl Engine {
     }
     pub fn toggle_mute(&self) {
         let _ = self.tx.send(Command::Mute);
+    }
+    /// Supplies Rune's shared device/queue to the media worker. The worker
+    /// only consumes it when `VEYRA_VIDEO_RENDERER=gpu-native` is selected.
+    pub fn set_gpu_context(&self, context: GpuContext) {
+        let _ = self.tx.send(Command::GpuContext(context));
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().unwrap().clone()

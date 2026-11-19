@@ -11,13 +11,17 @@ pub fn run(
     frame: Arc<Mutex<Option<VideoFrame>>>,
 ) {
     let mut decoder = None;
+    // Rune creates its device lazily. Keep the most recent published context
+    // so opening a file before (or after) the first UI frame has identical
+    // native-renderer behavior.
+    let mut gpu_context = None;
     let mut paused = false;
     loop {
         while let Ok(command) = rx.try_recv() {
             match command {
                 Command::Open(path) => {
                     decoder = None;
-                    match Decoder::open(&path) {
+                    match Decoder::open(&path, gpu_context.as_ref()) {
                         Ok(new_decoder) => {
                             let duration = new_decoder.duration();
                             let metadata = new_decoder.metadata();
@@ -51,6 +55,12 @@ pub fn run(
                             state.video_pixel_format = metadata.video_pixel_format;
                         }
                         Err(error) => snapshot.lock().unwrap().error = Some(error),
+                    }
+                }
+                Command::GpuContext(context) => {
+                    gpu_context = Some(context.clone());
+                    if let Some(decoder) = decoder.as_mut() {
+                        decoder.set_gpu_context(context);
                     }
                 }
                 Command::Pause => {

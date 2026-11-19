@@ -104,7 +104,7 @@ fn publish_frame(
     output: &Arc<Mutex<Option<VideoFrame>>>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
 ) {
-    snapshot.lock().unwrap().position = frame.timestamp;
+    snapshot.lock().unwrap().position = frame.timestamp();
     *output.lock().unwrap() = Some(frame);
 }
 

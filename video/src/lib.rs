@@ -12,5 +12,6 @@ pub(crate) mod worker;
 
 pub use commands::Command;
 pub use rendering::VideoFrame;
+pub use rune::native_surface::GpuContext;
 pub use state::Snapshot;
 pub use worker::run;
