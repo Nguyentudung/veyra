@@ -61,8 +61,10 @@ pub(crate) struct GpuRenderer {
     plane_views: Option<(wgpu::TextureView, wgpu::TextureView, wgpu::TextureView)>,
     bind_group: Option<wgpu::BindGroup>,
     plane_dimensions: (u32, u32),
+    // Only used for the uncommon negative-stride FFmpeg frames. Normal decoder
+    // output is uploaded directly from AVFrame plane memory.
     plane_buffers: [Vec<u8>; 3],
-    output: Option<(wgpu::Texture, u32, u32)>,
+    output: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
     readbacks: Vec<ReadbackSlot>,
     map_tx: mpsc::Sender<MapResult>,
     map_rx: mpsc::Receiver<MapResult>,
@@ -71,6 +73,9 @@ pub(crate) struct GpuRenderer {
     skipped_readbacks: u64,
     completed_frames: u64,
     last_upload_ms: f64,
+    last_encode_submit_ms: f64,
+    last_poll_ms: f64,
+    last_readback_copy_ms: f64,
     last_readback_latency_ms: f64,
     generation: u64,
 }
@@ -97,7 +102,10 @@ impl GpuRenderer {
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::Performance,
+            // A separate device is unavoidable until Rune accepts a shared
+            // texture. `Performance` can reserve large Vulkan allocator blocks
+            // for this short-lived off-screen workload, inflating process RSS.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| format!("Vulkan device unavailable: {e}"))?;
@@ -181,6 +189,9 @@ impl GpuRenderer {
             skipped_readbacks: 0,
             completed_frames: 0,
             last_upload_ms: 0.0,
+            last_encode_submit_ms: 0.0,
+            last_poll_ms: 0.0,
+            last_readback_copy_ms: 0.0,
             last_readback_latency_ms: 0.0,
             generation: 0,
         })
@@ -204,51 +215,44 @@ impl GpuRenderer {
             return Ok(ready);
         };
         let upload_started = Instant::now();
-        pack_plane_into(
+        self.ensure_plane_textures(width, height);
+        self.ensure_output_texture(width, height);
+        let stride = aligned_stride(width);
+        self.ensure_readback_buffer(slot_index, stride, height);
+        let (y_tex, u_tex, v_tex) = self.plane_textures.as_ref().unwrap();
+        upload_frame_plane(
+            &self.queue,
+            y_tex,
             (*frame).data[0],
             (*frame).linesize[0],
             width,
             height,
             &mut self.plane_buffers[0],
         )?;
-        pack_plane_into(
+        upload_frame_plane(
+            &self.queue,
+            u_tex,
             (*frame).data[1],
             (*frame).linesize[1],
             width.div_ceil(2),
             height.div_ceil(2),
             &mut self.plane_buffers[1],
         )?;
-        pack_plane_into(
+        upload_frame_plane(
+            &self.queue,
+            v_tex,
             (*frame).data[2],
             (*frame).linesize[2],
             width.div_ceil(2),
             height.div_ceil(2),
             &mut self.plane_buffers[2],
         )?;
-        self.ensure_plane_textures(width, height);
-        self.ensure_output_texture(width, height);
-        let stride = aligned_stride(width);
-        self.ensure_readback_buffer(slot_index, stride, height);
-        let (y_tex, u_tex, v_tex) = self.plane_textures.as_ref().unwrap();
-        self.upload_plane(y_tex, &self.plane_buffers[0], width, height);
-        self.upload_plane(
-            u_tex,
-            &self.plane_buffers[1],
-            width.div_ceil(2),
-            height.div_ceil(2),
-        );
-        self.upload_plane(
-            v_tex,
-            &self.plane_buffers[2],
-            width.div_ceil(2),
-            height.div_ceil(2),
-        );
         self.last_upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
 
+        let encode_started = Instant::now();
         {
-            let output = &self.output.as_ref().unwrap().0;
+            let (output, output_view, _, _) = self.output.as_ref().unwrap();
             let readback = self.readbacks[slot_index].buffer.as_ref().unwrap();
-            let output_view = output.create_view(&Default::default());
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -257,7 +261,7 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("veyra-video-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: output_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -297,6 +301,7 @@ impl GpuRenderer {
             );
             self.queue.submit(Some(encoder.finish()));
         }
+        self.last_encode_submit_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         self.readbacks[slot_index].state = SlotState::Mapping {
             width,
             height,
@@ -323,9 +328,11 @@ impl GpuRenderer {
     }
 
     pub(crate) fn poll_completed(&mut self) -> Result<Option<VideoFrame>, String> {
+        let poll_started = Instant::now();
         self.device
             .poll(wgpu::PollType::Poll)
             .map_err(|e| e.to_string())?;
+        self.last_poll_ms = poll_started.elapsed().as_secs_f64() * 1000.0;
         let mut newest = None;
         while let Ok(event) = self.map_rx.try_recv() {
             let slot = &mut self.readbacks[event.slot];
@@ -348,6 +355,7 @@ impl GpuRenderer {
                 continue;
             }
             let buffer = slot.buffer.as_ref().expect("mapped slot owns a buffer");
+            let copy_started = Instant::now();
             let mapped = buffer
                 .slice(..)
                 .get_mapped_range()
@@ -360,6 +368,7 @@ impl GpuRenderer {
             }
             drop(mapped);
             buffer.unmap();
+            self.last_readback_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
             if generation != self.generation {
                 continue;
             }
@@ -419,29 +428,27 @@ impl GpuRenderer {
         if self
             .output
             .as_ref()
-            .is_some_and(|(_, w, h)| *w == width && *h == height)
+            .is_some_and(|(_, _, w, h)| *w == width && *h == height)
         {
             return;
         }
         self.resource_creations = self.resource_creations.saturating_add(1);
-        self.output = Some((
-            self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("veyra-video-output"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            }),
-            width,
-            height,
-        ));
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("veyra-video-output"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        self.output = Some((texture, view, width, height));
     }
 
     fn ensure_plane_textures(&mut self, width: u32, height: u32) {
@@ -494,28 +501,6 @@ impl GpuRenderer {
         })
     }
 
-    fn upload_plane(&self, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: Default::default(),
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-
     fn log_diagnostics(&self) {
         if self.submitted_frames > 0 && self.submitted_frames % 300 == 0 {
             let occupied = self.readbacks.len()
@@ -525,13 +510,16 @@ impl GpuRenderer {
                     .filter(|slot| matches!(slot.state, SlotState::Idle))
                     .count();
             eprintln!(
-                "[video] Vulkan async: submitted={} completed={} skipped={} occupied_slots={}/{} upload_ms={:.2} readback_latency_ms={:.2} resource_creations={}",
+                "[video] Vulkan async: submitted={} completed={} skipped={} occupied_slots={}/{} upload_ms={:.2} encode_submit_ms={:.2} poll_ms={:.2} readback_copy_ms={:.2} readback_latency_ms={:.2} resource_creations={}",
                 self.submitted_frames,
                 self.completed_frames,
                 self.skipped_readbacks,
                 occupied,
                 READBACK_SLOT_COUNT,
                 self.last_upload_ms,
+                self.last_encode_submit_ms,
+                self.last_poll_ms,
+                self.last_readback_copy_ms,
                 self.last_readback_latency_ms,
                 self.resource_creations,
             );
@@ -560,23 +548,75 @@ fn binding_view<'a>(binding: u32, view: &'a wgpu::TextureView) -> wgpu::BindGrou
         resource: wgpu::BindingResource::TextureView(view),
     }
 }
-unsafe fn pack_plane_into(
+unsafe fn upload_frame_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
     data: *const u8,
     stride: i32,
     width: u32,
     height: u32,
-    output: &mut Vec<u8>,
+    fallback: &mut Vec<u8>,
 ) -> Result<(), String> {
-    if data.is_null() || stride < width as i32 {
+    if data.is_null() || stride.unsigned_abs() < width {
         return Err("invalid FFmpeg plane stride".into());
     }
-    output.resize((width * height) as usize, 0);
+
+    // `Queue::write_texture` permits arbitrary bytes-per-row; only encoder
+    // buffer-to-texture copies need the 256-byte alignment. This is the common
+    // case for FFmpeg software decoding and avoids copying every plane into a
+    // temporary Vec before wgpu copies it into its staging upload.
+    if stride > 0 {
+        let pitch = stride as usize;
+        let len = pitch
+            .checked_mul(height.saturating_sub(1) as usize)
+            .and_then(|n| n.checked_add(width as usize))
+            .ok_or("FFmpeg plane size overflow")?;
+        let bytes = std::slice::from_raw_parts(data, len);
+        write_plane(queue, texture, bytes, stride as u32, width, height);
+        return Ok(());
+    }
+
+    // Negative strides are unusual for decoded video but valid in FFmpeg. Pack
+    // only those frames so the normal path remains allocation- and copy-free.
+    let pitch = stride.unsigned_abs() as usize;
+    fallback.resize((width * height) as usize, 0);
     for row in 0..height as usize {
         std::ptr::copy_nonoverlapping(
-            data.add(row * stride as usize),
-            output.as_mut_ptr().add(row * width as usize),
+            data.offset(row as isize * stride as isize),
+            fallback.as_mut_ptr().add(row * width as usize),
             width as usize,
         );
     }
+    debug_assert!(pitch >= width as usize);
+    write_plane(queue, texture, fallback, width, width, height);
     Ok(())
+}
+
+fn write_plane(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    bytes_per_row: u32,
+    width: u32,
+    height: u32,
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Default::default(),
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }

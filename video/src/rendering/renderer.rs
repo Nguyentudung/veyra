@@ -74,19 +74,31 @@ pub(crate) enum VideoRenderer {
 impl VideoRenderer {
     pub(crate) fn new() -> Self {
         match std::env::var("VEYRA_VIDEO_RENDERER").as_deref() {
-            Ok("software") => {
-                eprintln!("[video] renderer=software (VEYRA_VIDEO_RENDERER=software)");
-                Self::Software(SoftwareRenderer::new())
-            }
-            _ => match GpuRenderer::new() {
+            // The current Vulkan route must read BGRA back to the CPU before
+            // Rune uploads it again. Benchmarks on 768x576 H.264 show that this
+            // costs more CPU and RSS than swscale, so it remains opt-in until
+            // Rune can consume a shared GPU texture.
+            Ok("vulkan") => match GpuRenderer::new() {
                 Ok(renderer) => Self::Vulkan(renderer),
                 Err(error) => {
                     eprintln!(
-                        "[video] Vulkan renderer unavailable; falling back to software: {error}"
+                        "[video] requested Vulkan renderer unavailable; falling back to software: {error}"
                     );
                     Self::Software(SoftwareRenderer::new())
                 }
             },
+            Ok("software") | Err(_) => {
+                eprintln!(
+                    "[video] renderer=software (default; set VEYRA_VIDEO_RENDERER=vulkan to opt in)"
+                );
+                Self::Software(SoftwareRenderer::new())
+            }
+            Ok(value) => {
+                eprintln!(
+                    "[video] unknown VEYRA_VIDEO_RENDERER={value:?}; using software (set it to `vulkan` to opt in)"
+                );
+                Self::Software(SoftwareRenderer::new())
+            }
         }
     }
 
