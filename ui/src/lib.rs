@@ -93,7 +93,10 @@ fn setup(state: &mut State, waker: Waker) {
 }
 
 fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    tx.wake_after(Duration::from_millis(16));
+    // Video is presented when a new frame arrives. Polling at the source's
+    // ~30 FPS cadence avoids composing the same NativeSurface frame twice on
+    // a 60 Hz timer; input and surface wakers still redraw immediately.
+    tx.wake_after(Duration::from_millis(33));
     let mut changed = false;
     if let Some(frame) = state.engine.take_latest_frame() {
         state.collector.record_rendered_frame();
@@ -173,13 +176,6 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         if let Some(error) = snapshot.error {
             state.status = error;
         }
-        changed = true;
-    }
-    // Keep the Rune surface on a steady ~60 Hz redraw cadence while playing.
-    // The source frame is still 29.97 FPS; between decoded frames the latest
-    // NativeSurface image is presented again instead of waiting for a new
-    // decoder frame. This smooths display cadence without fabricating motion.
-    if state.frame_id > 0 && !snapshot.paused && !snapshot.finished {
         changed = true;
     }
     changed

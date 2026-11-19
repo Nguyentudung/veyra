@@ -17,7 +17,7 @@ pub(crate) struct Decoder {
     video: Option<Codec>,
     frame: *mut super::ffi::AVFrame,
     audio_output: Option<AudioOutput>,
-    renderer: super::rendering::SoftwareRenderer,
+    renderer: super::rendering::VideoRenderer,
     presentation_clock: rendering::PresentationClock,
     initial_state: Snapshot,
 }
@@ -71,7 +71,7 @@ impl Decoder {
                 video,
                 frame,
                 audio_output: None,
-                renderer: super::rendering::SoftwareRenderer::new(),
+                renderer: super::rendering::VideoRenderer::new(),
                 presentation_clock: rendering::PresentationClock::new(),
                 initial_state: state,
             })
@@ -104,7 +104,14 @@ impl Decoder {
         frame_out: &Arc<Mutex<Option<VideoFrame>>>,
     ) -> Result<(), String> {
         unsafe {
-            let stream = self.demuxer.read_packet()?;
+            let stream = match self.demuxer.read_packet() {
+                Ok(stream) => stream,
+                Err(error) if error == "playback finished" => {
+                    rendering::finish_pending(&mut self.renderer, frame_out, snapshot)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             let packet = self.demuxer.packet;
             if self.video.as_ref().map(|codec| codec.stream_index) == Some(stream) {
                 if let Some(codec) = self.video.as_ref() {
@@ -131,6 +138,7 @@ impl Decoder {
                 }
             }
             super::ffi::av_packet_unref(packet);
+            rendering::publish_completed(&mut self.renderer, frame_out, snapshot)?;
             if let Some(video) = self.video.as_ref() {
                 let mut state = snapshot.lock().unwrap();
                 state.video_width = (*video.context).width as u32;
@@ -149,6 +157,7 @@ impl Decoder {
         let target = (current + delta).max(0.0);
         self.seek_absolute(target)?;
         self.presentation_clock.reset();
+        self.renderer.reset_pending();
         snapshot.lock().unwrap().position = target;
         Ok(())
     }
@@ -163,6 +172,7 @@ impl Decoder {
         let target = target.max(0.0).min(duration.unwrap_or(f64::MAX));
         self.seek_absolute(target)?;
         self.presentation_clock.reset();
+        self.renderer.reset_pending();
         *frame_out.lock().unwrap() = None;
         snapshot.lock().unwrap().position = target;
         Ok(())

@@ -1,5 +1,5 @@
 use super::super::ffi;
-use super::{frame::VideoFrame, renderer::SoftwareRenderer};
+use super::{frame::VideoFrame, renderer::VideoRenderer};
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -39,7 +39,7 @@ pub(crate) unsafe fn decode_video(
     context: *mut ffi::AVCodecContext,
     packet: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
-    renderer: &mut SoftwareRenderer,
+    renderer: &mut VideoRenderer,
     output: &Arc<Mutex<Option<VideoFrame>>>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
     time_base: ffi::AVRational,
@@ -50,18 +50,18 @@ pub(crate) unsafe fn decode_video(
         "send video packet",
     )?;
     while ffi::avcodec_receive_frame(context, frame) >= 0 {
-        let processing_started = Instant::now();
-        let (rgba, width, height) = renderer.convert(frame)?;
-        let processing_ms = processing_started.elapsed().as_secs_f64() * 1000.0;
         let timestamp = timestamp_seconds(frame, time_base);
+        // Pace decoding by the source PTS, independently of when an async GPU
+        // readback completes. Otherwise all slots could fill before the clock
+        // has a chance to slow the decoder down.
         clock.wait_until(timestamp);
-        *output.lock().unwrap() = Some(VideoFrame {
-            rgba,
-            width,
-            height,
-        });
+        let processing_started = Instant::now();
+        let rendered = renderer.convert(frame, timestamp)?;
+        let processing_ms = processing_started.elapsed().as_secs_f64() * 1000.0;
+        if let Some(frame) = rendered {
+            publish_frame(frame, output, snapshot);
+        }
         let mut state = snapshot.lock().unwrap();
-        state.position = timestamp;
         state.video_frames_processed = state.video_frames_processed.saturating_add(1);
         state.frame_processing_ms = Some(processing_ms);
         state.frame_processing_peak_ms = Some(
@@ -75,6 +75,37 @@ pub(crate) unsafe fn decode_video(
         state.frame_processing_avg_ms = Some(previous + (processing_ms - previous) / count);
     }
     Ok(())
+}
+
+pub(crate) fn publish_completed(
+    renderer: &mut VideoRenderer,
+    output: &Arc<Mutex<Option<VideoFrame>>>,
+    snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
+) -> Result<(), String> {
+    if let Some(frame) = renderer.poll_completed()? {
+        publish_frame(frame, output, snapshot);
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_pending(
+    renderer: &mut VideoRenderer,
+    output: &Arc<Mutex<Option<VideoFrame>>>,
+    snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
+) -> Result<(), String> {
+    if let Some(frame) = renderer.finish_pending()? {
+        publish_frame(frame, output, snapshot);
+    }
+    Ok(())
+}
+
+fn publish_frame(
+    frame: VideoFrame,
+    output: &Arc<Mutex<Option<VideoFrame>>>,
+    snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
+) {
+    snapshot.lock().unwrap().position = frame.timestamp;
+    *output.lock().unwrap() = Some(frame);
 }
 
 unsafe fn timestamp_seconds(frame: *mut ffi::AVFrame, fallback: ffi::AVRational) -> f64 {

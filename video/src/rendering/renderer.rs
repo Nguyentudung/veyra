@@ -1,4 +1,6 @@
 use super::super::ffi;
+use super::frame::VideoFrame;
+use super::gpu::GpuRenderer;
 
 pub(crate) struct SoftwareRenderer {
     context: *mut ffi::SwsContext,
@@ -60,6 +62,115 @@ impl Drop for SoftwareRenderer {
             if !self.context.is_null() {
                 ffi::sws_freeContext(self.context);
             }
+        }
+    }
+}
+
+pub(crate) enum VideoRenderer {
+    Software(SoftwareRenderer),
+    Vulkan(GpuRenderer),
+}
+
+impl VideoRenderer {
+    pub(crate) fn new() -> Self {
+        match std::env::var("VEYRA_VIDEO_RENDERER").as_deref() {
+            Ok("software") => {
+                eprintln!("[video] renderer=software (VEYRA_VIDEO_RENDERER=software)");
+                Self::Software(SoftwareRenderer::new())
+            }
+            _ => match GpuRenderer::new() {
+                Ok(renderer) => Self::Vulkan(renderer),
+                Err(error) => {
+                    eprintln!(
+                        "[video] Vulkan renderer unavailable; falling back to software: {error}"
+                    );
+                    Self::Software(SoftwareRenderer::new())
+                }
+            },
+        }
+    }
+
+    pub(crate) unsafe fn convert(
+        &mut self,
+        frame: *mut ffi::AVFrame,
+        timestamp: f64,
+    ) -> Result<Option<VideoFrame>, String> {
+        // Keep fallback local to the renderer: an unusual pixel format or a
+        // device loss must not stop playback or tear down the decoder.
+        let current = std::mem::replace(self, Self::Software(SoftwareRenderer::new()));
+        match current {
+            Self::Software(mut renderer) => {
+                let result = renderer.convert(frame);
+                *self = Self::Software(renderer);
+                result.map(|(rgba, width, height)| {
+                    Some(VideoFrame {
+                        rgba,
+                        width,
+                        height,
+                        timestamp,
+                    })
+                })
+            }
+            Self::Vulkan(mut renderer)
+                if (*frame).format == ffi::AVPixelFormat_AV_PIX_FMT_YUV420P =>
+            {
+                match renderer.render_yuv420p(frame, timestamp) {
+                    Ok(result) => {
+                        *self = Self::Vulkan(renderer);
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        eprintln!("[video] Vulkan frame failed; falling back to software: {error}");
+                        let mut software = SoftwareRenderer::new();
+                        let result = software.convert(frame);
+                        *self = Self::Software(software);
+                        result.map(|(rgba, width, height)| {
+                            Some(VideoFrame {
+                                rgba,
+                                width,
+                                height,
+                                timestamp,
+                            })
+                        })
+                    }
+                }
+            }
+            Self::Vulkan(_) => {
+                eprintln!(
+                    "[video] unsupported pixel format for Vulkan renderer; using software fallback"
+                );
+                let mut software = SoftwareRenderer::new();
+                let result = software.convert(frame);
+                *self = Self::Software(software);
+                result.map(|(rgba, width, height)| {
+                    Some(VideoFrame {
+                        rgba,
+                        width,
+                        height,
+                        timestamp,
+                    })
+                })
+            }
+        }
+    }
+
+    pub(crate) fn poll_completed(&mut self) -> Result<Option<VideoFrame>, String> {
+        match self {
+            Self::Software(_) => Ok(None),
+            Self::Vulkan(renderer) => renderer.poll_completed(),
+        }
+    }
+
+    pub(crate) fn finish_pending(&mut self) -> Result<Option<VideoFrame>, String> {
+        match self {
+            Self::Software(_) => Ok(None),
+            Self::Vulkan(renderer) => renderer.finish_pending(),
+        }
+    }
+
+    pub(crate) fn reset_pending(&mut self) {
+        if let Self::Vulkan(renderer) = self {
+            renderer.reset_pending();
         }
     }
 }
