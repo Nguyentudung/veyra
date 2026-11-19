@@ -50,10 +50,9 @@ after Rune has stopped using the associated views.
 
 Both sides must use exactly Rune's `wgpu` types. Veyra's native module imports
 `rune::wgpu`; it does not pass resources to the separate `wgpu` dependency
-used solely by the legacy readback renderer. During development, `ui` and
-`video` use the relative sibling worktree at `../../rune`. That worktree must
-contain the `GpuContext`, `GpuFrame`, `NativeSurface::gpu_context`, and
-`NativeSurface::push_gpu` bridge changes before this mode can run.
+used solely by the legacy readback renderer. Rune, including the
+`GpuContext`, `GpuFrame`, `NativeSurface::gpu_context`, and
+`NativeSurface::push_gpu` bridge, is vendored under `third_party/rune`.
 
 ## Validation procedure
 

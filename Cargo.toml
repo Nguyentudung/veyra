@@ -1,8 +1,9 @@
 [workspace]
 members = [
-    ".", "app", "cache", "playback", "playlist", "scripting",
+    "app", "cache", "playback", "playlist", "scripting",
     "statistics", "ui", "utils", "video",
 ]
+exclude = ["third_party/rune", "third_party/rune/**"]
 resolver = "2"
 
 [package]
@@ -18,9 +19,9 @@ veyra-app = { path = "app" }
 [dev-dependencies]
 
 [patch.crates-io]
-winit = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "cca5df6fafb4721d96fe105f126ebfd2ec351bb6" }
+winit = { path = "third_party/rune/vendor/winit" }
+parley_engine = { path = "third_party/rune/vendor/parley_engine" }
+accesskit_windows = { path = "third_party/rune/vendor/accesskit_windows" }
+accesskit_macos = { path = "third_party/rune/vendor/accesskit_macos" }
 
 

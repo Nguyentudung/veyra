@@ -38,7 +38,6 @@ dependencies = [
 [[package]]
 name = "accesskit_macos"
 version = "0.27.2"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -69,7 +68,6 @@ dependencies = [
 [[package]]
 name = "accesskit_windows"
 version = "0.35.2"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "accesskit",
  "accesskit_consumer",
@@ -2305,7 +2303,6 @@ checksum = "9c4482d912d7671a7cd2089794f90ef3bb5f5f8c738230fb0fcd50fa020f0ed3"
 [[package]]
 name = "parley_engine"
 version = "0.12.0"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "fontique",
  "harfrust",
@@ -4314,7 +4311,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/anomalyco/rune?rev=cca5df6fafb4721d96fe105f126ebfd2ec351bb6#cca5df6fafb4721d96fe105f126ebfd2ec351bb6"
 dependencies = [
  "ahash",
  "android-activity",

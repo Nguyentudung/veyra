@@ -10,9 +10,9 @@ veyra-cache = { path = "../cache" }
 pollster = "1.0.2"
 bytemuck = "1.24.0"
 wgpu = { version = "30.0.2", default-features = false, features = ["vulkan", "glsl", "wgsl"] }
-# Only gpu-native uses these re-exported wgpu types; the readback renderer
-# deliberately keeps its independent Vulkan device for compatibility.
-rune = { path = "../../rune/crates/rune" }
+# Only GPU-native modes use these re-exported wgpu types; readback deliberately
+# keeps its independent Vulkan device for compatibility.
+rune = { path = "../third_party/rune/crates/rune" }
 
 [build-dependencies]
 bindgen = "0.72.1"

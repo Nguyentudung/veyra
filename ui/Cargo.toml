@@ -5,10 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-# Mode B is developed against the sibling Rune worktree that exposes the
-# GPU-native NativeSurface bridge. Keep both crates on that exact workspace.
-rune = { path = "../../rune/crates/rune" }
-rune-kit = { path = "../../rune/crates/rune-kit" }
+# Rune is vendored with its license and local GPU bridge under third_party.
+rune = { path = "../third_party/rune/crates/rune" }
+rune-kit = { path = "../third_party/rune/crates/rune-kit" }
 veyra-playback = { path = "../playback" }
 veyra-playlist = { path = "../playlist" }
 veyra-scripting = { path = "../scripting" }

@@ -9,9 +9,10 @@ sudo apt install ffmpeg libavformat-dev libavcodec-dev libavutil-dev libswscale-
 cargo run
 cargo test --offline
 cargo build --release
+pidstat -u -r -p "$(pgrep -n veyra)" 1 30
 ```
 
-`build.rs` reads `wrapper.h`, generates bindings with bindgen, and links FFmpeg/ALSA libraries. Rune and Rune Kit are pinned git dependencies; the patch entries mirror Rune's own workspace patches so the app uses the same native integration crates.
+`build.rs` reads `wrapper.h`, generates bindings with bindgen, and links FFmpeg/ALSA libraries. Rune and Rune Kit are vendored under `third_party/rune` (including Rune's original license); the patch entries point to Rune's vendored native integration crates. A normal clone therefore needs no sibling Rune checkout or Git submodule initialization.
 
 ## Conventions
 
