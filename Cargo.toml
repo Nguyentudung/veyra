@@ -8,7 +8,7 @@ resolver = "2"
 
 [package]
 name = "veyra"
-version = "0.0.22"
+version = "0.0.23"
 edition = "2024"
 license = "Apache-2.0"
 description = "A focused native desktop media player built with Rust and Rune"
@@ -24,4 +24,8 @@ parley_engine = { path = "third_party/rune/vendor/parley_engine" }
 accesskit_windows = { path = "third_party/rune/vendor/accesskit_windows" }
 accesskit_macos = { path = "third_party/rune/vendor/accesskit_macos" }
 
-
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

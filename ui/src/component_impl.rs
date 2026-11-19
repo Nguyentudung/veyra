@@ -103,6 +103,10 @@ pub(crate) fn options_view(state: &State, kit: &Kit) -> El {
             s.scripts.reload();
             s.status = "Tools reloaded".into();
         }))
+        .child(menu_item(kit, "Lua console", "", |s| {
+            s.lua_console_open = !s.lua_console_open;
+            s.options_open = false;
+        }))
         .child(separator())
         .child(menu_item(
             kit,

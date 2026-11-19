@@ -23,4 +23,9 @@ impl ScriptManager {
     pub fn dispatch(&self, event: PlaybackEvent, stats: StatisticsSnapshot) {
         self.runtime.event(event.payload(&stats), stats);
     }
+    /// Evaluates a single Lua chunk on the script thread. Results and errors
+    /// are intentionally printed to stderr for developer debugging.
+    pub fn eval(&self, source: String) {
+        self.runtime.eval(source)
+    }
 }

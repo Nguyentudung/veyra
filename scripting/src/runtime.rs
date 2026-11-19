@@ -1,5 +1,5 @@
 use super::{api, events::EventPayload};
-use mlua::{Function, Lua, RegistryKey, Result};
+use mlua::{Function, Lua, RegistryKey, Result, Value};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -11,6 +11,7 @@ pub(crate) enum Command {
     LoadAll,
     Reload,
     Event(EventPayload, StatisticsSnapshot),
+    Eval(String),
     Shutdown,
 }
 
@@ -42,6 +43,7 @@ impl RuntimeHandle {
                             *current.lock().unwrap() = snapshot.clone();
                             dispatch(&lua, &callbacks, &payload);
                         }
+                        Command::Eval(source) => evaluate_console(&lua, &source),
                         Command::Shutdown => break,
                     }
                 }
@@ -67,6 +69,9 @@ impl RuntimeHandle {
     }
     pub fn event(&self, payload: EventPayload, stats: StatisticsSnapshot) {
         let _ = self.tx.send(Command::Event(payload, stats));
+    }
+    pub fn eval(&self, source: String) {
+        let _ = self.tx.send(Command::Eval(source));
     }
 }
 impl Drop for RuntimeHandle {
@@ -100,18 +105,19 @@ fn load_tools_from_directory(lua: &Lua, dir: &Path, errors: &mut Vec<String>) ->
         if path.is_dir() {
             load_tools_from_directory(lua, &path, errors)?;
         } else if path.extension().is_some_and(|x| x == "lua") {
-            match std::fs::read_to_string(&path).and_then(|source| {
-                lua.load(&source)
-                    .set_name(path.to_string_lossy())
-                    .exec()
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            }) {
-                Ok(()) => {}
-                Err(e) => errors.push(format!("{}: {e}", path.display())),
+            match std::fs::read_to_string(&path) {
+                Ok(source) => load_source(lua, &path.display().to_string(), &source, errors),
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
             }
         }
     }
     Ok(())
+}
+
+fn load_source(lua: &Lua, name: &str, source: &str, errors: &mut Vec<String>) {
+    if let Err(error) = lua.load(source).set_name(name).exec() {
+        errors.push(format!("{name}: {error}"));
+    }
 }
 
 fn dispatch(lua: &Lua, callbacks: &Arc<Mutex<Vec<(String, RegistryKey)>>>, payload: &EventPayload) {
@@ -136,6 +142,15 @@ fn dispatch(lua: &Lua, callbacks: &Arc<Mutex<Vec<(String, RegistryKey)>>>, paylo
     }
 }
 
+fn evaluate_console(lua: &Lua, source: &str) {
+    eprintln!("veyra lua> {source}");
+    match lua.load(source).set_name("console").eval::<Value>() {
+        Ok(Value::Nil) => {}
+        Ok(value) => eprintln!("veyra lua = {value:?}"),
+        Err(error) => eprintln!("veyra lua error: {error}"),
+    }
+}
+
 fn install_api(
     lua: &Lua,
     callbacks: Arc<Mutex<Vec<(String, RegistryKey)>>>,
@@ -151,6 +166,27 @@ fn install_api(
         "log",
         lua.create_function(|_, message: String| {
             eprintln!("veyra lua: {message}");
+            Ok(())
+        })?,
+    )?;
+    let benchmark_current = Arc::clone(&current);
+    veyra.set(
+        "benchmark",
+        lua.create_function(move |_, ()| {
+            let stats = benchmark_current.lock().unwrap();
+            eprintln!(
+                "veyra benchmark: file={} processed={} rendered={} render_fps={:?} frame_interval_ms={:?} jitter_ms={:?} conversion_current_ms={:?} conversion_avg_ms={:?} conversion_peak_ms={:?} dropped_frames={:?}",
+                stats.file_name.as_deref().unwrap_or("<none>"),
+                stats.video_frames_processed,
+                stats.rendered_frames,
+                stats.render_fps,
+                stats.frame_interval_ms,
+                stats.frame_jitter_ms,
+                stats.frame_processing_ms,
+                stats.frame_processing_avg_ms,
+                stats.frame_processing_peak_ms,
+                stats.dropped_frames,
+            );
             Ok(())
         })?,
     )?;

@@ -5,7 +5,8 @@ use self::theme::glass_capsule;
 use rune::color::hex;
 use rune::native_surface::{ByteFrame, ColorInfo, Format};
 use rune::{
-    AppSpec, Cx, El, NativeSurface, SurfaceFit, TextStyle, Tx, Waker, col, el, icon, row, text,
+    AppSpec, Cx, El, NativeSurface, SurfaceFit, TextEdit, TextStyle, Tx, Waker, col, el, icon, row,
+    text,
 };
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, PaletteSeed,
@@ -18,6 +19,7 @@ use veyra_statistics::{StatisticsCollector, StatisticsSnapshot};
 use veyra_utils::format_time;
 
 mod component_impl;
+mod lua_console;
 mod lucide;
 mod options_menu;
 mod playback_controls;
@@ -49,6 +51,8 @@ pub struct State {
     statistics_page: usize,
     options_open: bool,
     gpu_generation: Option<u64>,
+    lua_console_open: bool,
+    lua_console_input: TextEdit,
 }
 
 pub fn run() {
@@ -86,6 +90,8 @@ impl State {
             statistics_page: 0,
             options_open: false,
             gpu_generation: None,
+            lua_console_open: false,
+            lua_console_input: TextEdit::default(),
         }
     }
 }
@@ -266,6 +272,11 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
             .child(options_menu::trigger(state, &kit))
             .child(if state.options_open {
                 options_menu::view(state, &kit)
+            } else {
+                el()
+            })
+            .child(if state.lua_console_open {
+                lua_console::view(state, &kit)
             } else {
                 el()
             })
