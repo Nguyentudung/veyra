@@ -5,14 +5,28 @@ use super::gpu_native::NativeGpuRenderer;
 use super::gpu_video::NativeVideoRenderer;
 use crate::GpuContext;
 
+// libswscale can use vector stores past the final visible BGRA pixel. Keep its
+// rows 64-byte aligned, then pack them before the existing tight ByteFrame API.
+const SWS_OUTPUT_ROW_ALIGNMENT: usize = 64;
+
 pub(crate) struct SoftwareRenderer {
     context: *mut ffi::SwsContext,
+    /// A diagnostics-only canary after the BGRA image. This is never enabled
+    /// during normal playback and lets us prove an out-of-bounds destination
+    /// write before the allocator reports later heap corruption.
+    output_guard_bytes: usize,
 }
 
 impl SoftwareRenderer {
     pub(crate) fn new() -> Self {
         Self {
             context: std::ptr::null_mut(),
+            output_guard_bytes: matches!(
+                std::env::var("VEYRA_VIDEO_DIAGNOSTICS").as_deref(),
+                Ok("scale-guard")
+            )
+            .then_some(64 * 1024)
+            .unwrap_or(0),
         }
     }
     pub(crate) unsafe fn convert(
@@ -38,24 +52,80 @@ impl SoftwareRenderer {
         if self.context.is_null() {
             return Err("could not create software pixel converter".into());
         }
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        let width = usize::try_from(width).map_err(|_| "invalid software frame width")?;
+        let height = usize::try_from(height).map_err(|_| "invalid software frame height")?;
+        let tight_stride = width.checked_mul(4).ok_or("software frame size overflow")?;
+        let output_stride = tight_stride
+            .checked_add(SWS_OUTPUT_ROW_ALIGNMENT - 1)
+            .ok_or("software frame stride overflow")?
+            / SWS_OUTPUT_ROW_ALIGNMENT
+            * SWS_OUTPUT_ROW_ALIGNMENT;
+        let image_bytes = tight_stride
+            .checked_mul(height)
+            .ok_or("software frame size overflow")?;
+        let scaled_bytes = output_stride
+            .checked_mul(height)
+            .ok_or("software frame buffer size overflow")?;
+        let mut rgba = vec![0u8; scaled_bytes];
+        if self.output_guard_bytes != 0 {
+            // Use a non-zero pattern: a zero-filled guard could fail to detect
+            // an overrun made solely of zero-valued color components.
+            rgba.resize(scaled_bytes + self.output_guard_bytes, 0xA5);
+        }
         let mut data = [
             rgba.as_mut_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         ];
-        let lines = [width * 4, 0, 0, 0];
-        ffi::sws_scale(
+        let lines = [
+            i32::try_from(output_stride).map_err(|_| "software frame stride too large")?,
+            0,
+            0,
+            0,
+        ];
+        let rows_written = ffi::sws_scale(
             self.context,
             (*frame).data.as_ptr() as *const *const u8,
             (*frame).linesize.as_ptr(),
             0,
-            height,
+            i32::try_from(height).map_err(|_| "software frame height too large")?,
             data.as_mut_ptr(),
             lines.as_ptr(),
         );
-        Ok((rgba, width as u32, height as u32))
+        if rows_written != height as i32 {
+            return Err(format!(
+                "sws_scale produced {rows_written} rows for a {height}-row frame"
+            ));
+        }
+        let guard = &rgba[scaled_bytes..];
+        if self.output_guard_bytes != 0
+            && let Some(first_changed) = guard.iter().position(|byte| *byte != 0xA5)
+        {
+            let last_changed = guard
+                .iter()
+                .rposition(|byte| *byte != 0xA5)
+                .unwrap_or(first_changed);
+            let changed_bytes = guard.iter().filter(|byte| **byte != 0xA5).count();
+            return Err(format!(
+                "sws_scale wrote beyond the {scaled_bytes}-byte BGRA destination (guard changed: {changed_bytes} bytes, first: {first_changed}, last: {last_changed}, guard: {} bytes)",
+                self.output_guard_bytes,
+            ));
+        }
+        // Rune's established ByteFrame path takes tightly packed rows. Copy
+        // away only the alignment padding that libswscale needs internally.
+        if output_stride == tight_stride {
+            rgba.truncate(image_bytes);
+            return Ok((rgba, width as u32, height as u32));
+        }
+        let mut packed = vec![0u8; image_bytes];
+        for row in 0..height {
+            let source_start = row * output_stride;
+            let target_start = row * tight_stride;
+            packed[target_start..target_start + tight_stride]
+                .copy_from_slice(&rgba[source_start..source_start + tight_stride]);
+        }
+        Ok((packed, width as u32, height as u32))
     }
 }
 

@@ -75,6 +75,7 @@ pub(crate) struct NativeVideoRenderer {
 
 impl NativeVideoRenderer {
     pub(crate) fn new(context: GpuContext) -> Result<Self, String> {
+        context.compositor_diagnostics.set_renderer("gpu-video");
         Ok(Self {
             context,
             pool: None,
@@ -132,6 +133,7 @@ impl NativeVideoRenderer {
         let upload_started = Instant::now();
         upload_r8_plane(
             &self.context.queue,
+            &self.context.compositor_diagnostics,
             &slot_textures._y,
             (*frame).data[0],
             (*frame).linesize[0],
@@ -144,6 +146,7 @@ impl NativeVideoRenderer {
         match (*frame).format {
             ffi::AVPixelFormat_AV_PIX_FMT_NV12 => upload_rg8_plane(
                 &self.context.queue,
+                &self.context.compositor_diagnostics,
                 &slot_textures._uv,
                 (*frame).data[1],
                 (*frame).linesize[1],
@@ -163,6 +166,7 @@ impl NativeVideoRenderer {
                 )?;
                 write_texture(
                     &self.context.queue,
+                    &self.context.compositor_diagnostics,
                     &slot_textures._uv,
                     &self.uv_interleaved,
                     chroma_width * 2,
@@ -195,14 +199,24 @@ impl NativeVideoRenderer {
     }
 
     fn ensure_pool(&mut self, width: u32, height: u32) -> Arc<PlanePool> {
-        if let Some(pool) = self.pool.as_ref().filter(|pool| pool.size == [width, height]) {
+        if let Some(pool) = self
+            .pool
+            .as_ref()
+            .filter(|pool| pool.size == [width, height])
+        {
             return Arc::clone(pool);
         }
         self.next_pool_id = self.next_pool_id.wrapping_add(1);
         let device = &self.context.device;
         let slots = (0..VIDEO_SLOT_COUNT)
             .map(|_| {
-                let y = plane_texture(device, "veyra-video-y", width, height, wgpu::TextureFormat::R8Unorm);
+                let y = plane_texture(
+                    device,
+                    "veyra-video-y",
+                    width,
+                    height,
+                    wgpu::TextureFormat::R8Unorm,
+                );
                 let uv = plane_texture(
                     device,
                     "veyra-video-uv",
@@ -210,8 +224,15 @@ impl NativeVideoRenderer {
                     height.div_ceil(2),
                     wgpu::TextureFormat::Rg8Unorm,
                 );
-                let views = [y.create_view(&Default::default()), uv.create_view(&Default::default())];
-                PlaneSlot { _y: y, _uv: uv, views }
+                let views = [
+                    y.create_view(&Default::default()),
+                    uv.create_view(&Default::default()),
+                ];
+                PlaneSlot {
+                    _y: y,
+                    _uv: uv,
+                    views,
+                }
             })
             .collect();
         let pool = Arc::new(PlanePool {
@@ -271,6 +292,7 @@ fn plane_texture(
 
 unsafe fn upload_r8_plane(
     queue: &wgpu::Queue,
+    diagnostics: &rune::native_surface::CompositorDiagnostics,
     texture: &wgpu::Texture,
     data: *const u8,
     stride: i32,
@@ -278,11 +300,22 @@ unsafe fn upload_r8_plane(
     height: u32,
     fallback: &mut Vec<u8>,
 ) -> Result<(), String> {
-    upload_plane(queue, texture, data, stride, width, height, 1, fallback)
+    upload_plane(
+        queue,
+        diagnostics,
+        texture,
+        data,
+        stride,
+        width,
+        height,
+        1,
+        fallback,
+    )
 }
 
 unsafe fn upload_rg8_plane(
     queue: &wgpu::Queue,
+    diagnostics: &rune::native_surface::CompositorDiagnostics,
     texture: &wgpu::Texture,
     data: *const u8,
     stride: i32,
@@ -290,11 +323,22 @@ unsafe fn upload_rg8_plane(
     height: u32,
     fallback: &mut Vec<u8>,
 ) -> Result<(), String> {
-    upload_plane(queue, texture, data, stride, width, height, 2, fallback)
+    upload_plane(
+        queue,
+        diagnostics,
+        texture,
+        data,
+        stride,
+        width,
+        height,
+        2,
+        fallback,
+    )
 }
 
 unsafe fn upload_plane(
     queue: &wgpu::Queue,
+    diagnostics: &rune::native_surface::CompositorDiagnostics,
     texture: &wgpu::Texture,
     data: *const u8,
     stride: i32,
@@ -317,6 +361,7 @@ unsafe fn upload_plane(
             .ok_or("FFmpeg plane size overflow")?;
         write_texture(
             queue,
+            diagnostics,
             texture,
             std::slice::from_raw_parts(data, len),
             stride as u32,
@@ -333,7 +378,15 @@ unsafe fn upload_plane(
             packed_row as usize,
         );
     }
-    write_texture(queue, texture, fallback, packed_row, width, height);
+    write_texture(
+        queue,
+        diagnostics,
+        texture,
+        fallback,
+        packed_row,
+        width,
+        height,
+    );
     Ok(())
 }
 
@@ -368,6 +421,7 @@ unsafe fn interleave_yuv420p(
 
 fn write_texture(
     queue: &wgpu::Queue,
+    diagnostics: &rune::native_surface::CompositorDiagnostics,
     texture: &wgpu::Texture,
     bytes: &[u8],
     bytes_per_row: u32,
@@ -393,6 +447,7 @@ fn write_texture(
             depth_or_array_layers: 1,
         },
     );
+    diagnostics.record_write_texture();
 }
 
 unsafe fn color_info(

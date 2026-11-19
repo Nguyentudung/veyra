@@ -1,7 +1,10 @@
 use super::super::ffi;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 use veyra_cache::{MemoryBudget, Reservation};
@@ -10,6 +13,7 @@ pub(super) const OUTPUT_RATE: i64 = 48_000;
 const OUTPUT_CHANNELS: u32 = 2;
 const MAX_QUEUED_FRAMES: u64 = OUTPUT_RATE as u64 * 2;
 const PREBUFFER_FRAMES: u64 = OUTPUT_RATE as u64 / 5;
+static AUDIO_OUTPUT_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct AudioChunk {
     samples: Vec<u8>,
@@ -78,8 +82,9 @@ impl AudioOutput {
         let thread = thread::spawn(move || unsafe {
             run_audio_output(pcm_address as *mut ffi::snd_pcm_t, queue_for_thread);
         });
+        let open = AUDIO_OUTPUT_OPEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         eprintln!(
-            "veyra audio: ALSA default, input {} Hz/{} channels/format {}, output {} Hz/{} channels S16_LE",
+            "veyra audio: ALSA default opened #{open}, input {} Hz/{} channels/format {}, output {} Hz/{} channels S16_LE",
             rate, channels, sample_format, OUTPUT_RATE, OUTPUT_CHANNELS
         );
         Ok(Self {

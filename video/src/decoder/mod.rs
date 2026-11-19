@@ -198,6 +198,13 @@ impl Decoder {
                 target,
             )
         }?;
+        // Seeking must discard already queued PCM so stale audio cannot play
+        // against the reset video clock. The next decoded audio frame opens a
+        // fresh ALSA stream; make this visible because it is expected on seek
+        // but not during steady playback.
+        if self.audio_output.is_some() {
+            eprintln!("[audio] resetting output for seek to {target:.3}s");
+        }
         self.audio_output = None;
         Ok(())
     }

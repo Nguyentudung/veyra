@@ -100,11 +100,12 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     // a 60 Hz timer; input and surface wakers still redraw immediately.
     tx.wake_after(Duration::from_millis(33));
     let mut changed = false;
-    if let Some(context) = state.surface.gpu_context() {
-        if state.gpu_generation != Some(context.generation) {
-            state.engine.set_gpu_context(context.clone());
-            state.gpu_generation = Some(context.generation);
+    let generation = state.surface.gpu_generation();
+    if state.gpu_generation != generation {
+        if let Some(context) = state.surface.gpu_context() {
+            state.engine.set_gpu_context(context);
         }
+        state.gpu_generation = generation;
     }
     if let Some(frame) = state.engine.take_latest_frame() {
         state.collector.record_rendered_frame();

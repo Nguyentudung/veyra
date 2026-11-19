@@ -9,13 +9,62 @@ use std::{
 pub(crate) struct PresentationClock {
     started_at: Option<Instant>,
     first_pts: Option<f64>,
+    diagnostics: DiagnosticMode,
+    diagnostics_frames: u64,
+    diagnostics_started: Instant,
+}
+
+/// Opt-in probes for locating failures at the software presentation boundary.
+/// They deliberately preserve demuxing, decoding and PTS pacing. None of these
+/// modes is used during ordinary playback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticMode {
+    Disabled,
+    DecodeOnly,
+    AllocOnly,
+    ScaleOnly,
+    ScaleGuard,
+    RenderOnly,
+}
+
+impl DiagnosticMode {
+    fn from_environment() -> Self {
+        match std::env::var("VEYRA_VIDEO_DIAGNOSTICS").as_deref() {
+            Ok("decode-only") => Self::DecodeOnly,
+            Ok("alloc-only") => Self::AllocOnly,
+            Ok("scale-only") => Self::ScaleOnly,
+            Ok("scale-guard") => Self::ScaleGuard,
+            // Explicitly exercises the same conversion and presentation path
+            // as normal playback, while labelling it in the diagnostic output.
+            Ok("render-only") => Self::RenderOnly,
+            _ => Self::Disabled,
+        }
+    }
+
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::DecodeOnly => Some("decode-only"),
+            Self::AllocOnly => Some("alloc-only"),
+            Self::ScaleOnly => Some("scale-only"),
+            Self::ScaleGuard => Some("scale-guard"),
+            Self::RenderOnly => Some("render-only"),
+        }
+    }
 }
 
 impl PresentationClock {
     pub(crate) fn new() -> Self {
+        let diagnostics = DiagnosticMode::from_environment();
+        if let Some(mode) = diagnostics.label() {
+            eprintln!("[video] diagnostics={mode}");
+        }
         Self {
             started_at: None,
             first_pts: None,
+            diagnostics,
+            diagnostics_frames: 0,
+            diagnostics_started: Instant::now(),
         }
     }
 
@@ -32,6 +81,35 @@ impl PresentationClock {
         if let Some(remaining) = target.checked_duration_since(now) {
             thread::sleep(remaining);
         }
+    }
+
+    fn diagnostics(&self) -> DiagnosticMode {
+        self.diagnostics
+    }
+
+    /// Reports diagnostic frames at a low rate without adding work per frame.
+    fn observe_diagnostic_frame(&mut self, frame: *const ffi::AVFrame) {
+        self.diagnostics_frames = self.diagnostics_frames.saturating_add(1);
+        let elapsed = self.diagnostics_started.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        unsafe {
+            eprintln!(
+                "[video][{}] interval_ms={:.0} decoded_frames={} size={}x{} format={} strides=[{}, {}, {}]",
+                self.diagnostics.label().unwrap_or("disabled"),
+                elapsed.as_secs_f64() * 1000.0,
+                self.diagnostics_frames,
+                (*frame).width,
+                (*frame).height,
+                (*frame).format,
+                (*frame).linesize[0],
+                (*frame).linesize[1],
+                (*frame).linesize[2],
+            );
+        }
+        self.diagnostics_frames = 0;
+        self.diagnostics_started = Instant::now();
     }
 }
 
@@ -56,7 +134,45 @@ pub(crate) unsafe fn decode_video(
         // has a chance to slow the decoder down.
         clock.wait_until(timestamp);
         let processing_started = Instant::now();
-        let rendered = renderer.convert(frame, timestamp)?;
+        let rendered = match clock.diagnostics() {
+            // This probe does not touch the renderer at all.
+            DiagnosticMode::DecodeOnly => {
+                clock.observe_diagnostic_frame(frame);
+                None
+            }
+            // Match the software renderer's zero-filled BGRA allocation, but
+            // do not create a swscale context, scale pixels, or publish to Rune.
+            DiagnosticMode::AllocOnly => {
+                let bytes = ((*frame).width as usize)
+                    .saturating_mul((*frame).height as usize)
+                    .saturating_mul(4);
+                std::hint::black_box(vec![0_u8; bytes]);
+                clock.observe_diagnostic_frame(frame);
+                None
+            }
+            // Exercise sws_getContext, the BGRA allocation and sws_scale; drop
+            // the converted frame before it can reach the Rune upload path.
+            DiagnosticMode::ScaleOnly => {
+                let converted = renderer.convert(frame, timestamp)?;
+                std::hint::black_box(converted);
+                clock.observe_diagnostic_frame(frame);
+                None
+            }
+            // Same as scale-only, but SoftwareRenderer places a canary after
+            // the output allocation and reports a destination overrun before
+            // malloc has to detect it later.
+            DiagnosticMode::ScaleGuard => {
+                let converted = renderer.convert(frame, timestamp)?;
+                std::hint::black_box(converted);
+                clock.observe_diagnostic_frame(frame);
+                None
+            }
+            // This is intentionally the ordinary renderer path, named so a
+            // capture can explicitly include the Rune presentation boundary.
+            DiagnosticMode::RenderOnly | DiagnosticMode::Disabled => {
+                renderer.convert(frame, timestamp)?
+            }
+        };
         let processing_ms = processing_started.elapsed().as_secs_f64() * 1000.0;
         if let Some(frame) = rendered {
             publish_frame(frame, output, snapshot);
