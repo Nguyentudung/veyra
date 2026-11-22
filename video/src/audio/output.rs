@@ -109,7 +109,7 @@ impl AudioOutput {
         self.queue.wake.notify_all();
     }
 
-    pub(super) fn write(&mut self, samples: &[u8], frames: u64) -> Result<(), String> {
+    pub(super) fn write(&mut self, samples: Vec<u8>, frames: u64) -> Result<(), String> {
         if frames == 0 {
             return Ok(());
         }
@@ -133,7 +133,7 @@ impl AudioOutput {
             return Err("audio output stopped".into());
         }
         state.chunks.push_back(AudioChunk {
-            samples: samples.to_vec(),
+            samples,
             frames,
             _reservation: reservation,
         });

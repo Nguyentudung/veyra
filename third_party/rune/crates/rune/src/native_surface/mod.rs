@@ -268,7 +268,7 @@ impl NativeSurface {
         if frame.size_px.contains(&0) || frame.size_px.iter().any(|v| *v > 16384) {
             return Err("video size must be 1..16384".into());
         }
-        if self.gpu_context().map(|context| context.generation) != Some(frame.generation) {
+        if self.gpu_generation() != Some(frame.generation) {
             return Err("GPU frame belongs to an unavailable or replaced device".into());
         }
         self.replace(Frame {
@@ -291,7 +291,7 @@ impl NativeSurface {
         if !matches!(frame.format, Format::Nv12Video | Format::Nv12Full) {
             return Err("GPU video frame must use NV12 format".into());
         }
-        if self.gpu_context().map(|context| context.generation) != Some(frame.generation) {
+        if self.gpu_generation() != Some(frame.generation) {
             return Err("GPU video frame belongs to an unavailable or replaced device".into());
         }
         let size = frame.size_px;

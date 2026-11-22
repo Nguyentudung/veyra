@@ -428,9 +428,17 @@ impl SurfaceRenderer {
         // All native surfaces in this renderer share the same queue. Producers
         // publish only textures rendered on this context, so submission order
         // provides the upload/render/sample ordering without external fences.
-        let gpu_context = GpuContext::with_diagnostics(device, queue, 1, self.diagnostics.clone());
+        // Most frames reuse the already-published context. Build the context
+        // lazily so steady-state video presentation does not clone the wgpu
+        // device and queue handles for every UI frame.
+        let mut gpu_context = None;
         for draw in draws {
-            draw.surface.publish_gpu_context(&gpu_context);
+            if draw.surface.gpu_generation() != Some(1) {
+                let context = gpu_context.get_or_insert_with(|| {
+                    GpuContext::with_diagnostics(device, queue, 1, self.diagnostics.clone())
+                });
+                draw.surface.publish_gpu_context(context);
+            }
         }
         *self.queries_used.get_mut() = false;
         // Release an unsubmitted preparation before acquiring its replacement. Submitted

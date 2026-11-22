@@ -1,14 +1,15 @@
 # Direct YUV handoff (Mode C)
 
-Mode C is the experimental presentation path intended to remove Mode B's
-intermediate BGRA render pass. Start it explicitly:
+Mode C is Veyra's default presentation path. It removes Mode B's intermediate
+BGRA render pass and is selected automatically for 8-bit YUV420P/NV12 video.
+For reproducible non-interactive profiling, set `VEYRA_OPEN_MEDIA`:
 
 ```sh
-VEYRA_VIDEO_RENDERER=gpu-video ./target/release/veyra video_test/test.mp4
+VEYRA_OPEN_MEDIA=video_test/test.mp4 ./target/release/veyra
 ```
 
-`software` remains the default. `vulkan`/`vulkan-readback` select the legacy
-readback diagnostic renderer, and `gpu-native` selects Mode B.
+`software` remains the explicit portable fallback. `vulkan`/`vulkan-readback`
+select the legacy readback diagnostic renderer, and `gpu-native` selects Mode B.
 
 ## Path and supported input
 
@@ -44,9 +45,9 @@ Build and run the same clip at the same window size for each mode:
 
 ```sh
 cargo build --release
-VEYRA_VIDEO_RENDERER=software ./target/release/veyra video_test/test.mp4
-VEYRA_VIDEO_RENDERER=gpu-native ./target/release/veyra video_test/test.mp4
-VEYRA_VIDEO_RENDERER=gpu-video ./target/release/veyra video_test/test.mp4
+VEYRA_OPEN_MEDIA=video_test/test.mp4 VEYRA_VIDEO_RENDERER=software ./target/release/veyra
+VEYRA_OPEN_MEDIA=video_test/test.mp4 VEYRA_VIDEO_RENDERER=gpu-native ./target/release/veyra
+VEYRA_OPEN_MEDIA=video_test/test.mp4 VEYRA_VIDEO_RENDERER=gpu-video ./target/release/veyra
 pidstat -u -r -p "$(pgrep -n veyra)" 1 30
 ```
 
@@ -102,7 +103,7 @@ numbers below describe only producer work.
 | Software | Not remeasured | Not remeasured | CPU conversion/upload path | Pending controlled run |
 | Vulkan readback | Not remeasured | Not remeasured | Has encoder, BGRA readback and polling | Pending controlled run |
 | Mode B | Not remeasured | Not remeasured | Has Veyra YUV-to-BGRA pass and an extra submit | Pending controlled run |
-| Mode C | Not yet measured | Not yet measured | 0.22–0.27 ms upload; 0.07–0.09 ms YUV420P interleave; no starvation in one run | Not comparable yet |
+| Mode C | Not measured in this document | 184 MB RSS / 122 MB PSS at 8 s on 1080×1920 H.264/AAC, 60 fps | 1.29 ms upload; 0.92 ms YUV420P interleave; no starvation after 300 uploads | One-host point sample; compare under the same protocol |
 
 For each row, play the same file at the same window size for 60–120 seconds,
 wait for warm-up, and record only active playback. Capture `pidstat` and a

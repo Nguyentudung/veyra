@@ -6,11 +6,13 @@ pub(crate) mod audio;
 mod commands;
 pub(crate) mod decoder;
 pub(crate) mod ffi;
+mod mailbox;
 pub(crate) mod rendering;
 mod state;
 pub(crate) mod worker;
 
 pub use commands::Command;
+pub use mailbox::{FrameMailbox, FrameWaker};
 pub use rendering::VideoFrame;
 pub use rune::native_surface::GpuContext;
 pub use state::Snapshot;

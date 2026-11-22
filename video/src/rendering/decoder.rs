@@ -1,5 +1,6 @@
 use super::super::ffi;
 use super::{frame::VideoFrame, renderer::VideoRenderer};
+use crate::FrameMailbox;
 use std::{
     sync::{Arc, Mutex},
     thread,
@@ -118,7 +119,7 @@ pub(crate) unsafe fn decode_video(
     packet: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
     renderer: &mut VideoRenderer,
-    output: &Arc<Mutex<Option<VideoFrame>>>,
+    output: &Arc<FrameMailbox>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
     time_base: ffi::AVRational,
     clock: &mut PresentationClock,
@@ -195,7 +196,7 @@ pub(crate) unsafe fn decode_video(
 
 pub(crate) fn publish_completed(
     renderer: &mut VideoRenderer,
-    output: &Arc<Mutex<Option<VideoFrame>>>,
+    output: &Arc<FrameMailbox>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
 ) -> Result<(), String> {
     if let Some(frame) = renderer.poll_completed()? {
@@ -206,7 +207,7 @@ pub(crate) fn publish_completed(
 
 pub(crate) fn finish_pending(
     renderer: &mut VideoRenderer,
-    output: &Arc<Mutex<Option<VideoFrame>>>,
+    output: &Arc<FrameMailbox>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
 ) -> Result<(), String> {
     if let Some(frame) = renderer.finish_pending()? {
@@ -217,11 +218,11 @@ pub(crate) fn finish_pending(
 
 fn publish_frame(
     frame: VideoFrame,
-    output: &Arc<Mutex<Option<VideoFrame>>>,
+    output: &Arc<FrameMailbox>,
     snapshot: &Arc<Mutex<super::super::state::Snapshot>>,
 ) {
     snapshot.lock().unwrap().position = frame.timestamp();
-    *output.lock().unwrap() = Some(frame);
+    output.publish(frame);
 }
 
 unsafe fn timestamp_seconds(frame: *mut ffi::AVFrame, fallback: ffi::AVRational) -> f64 {

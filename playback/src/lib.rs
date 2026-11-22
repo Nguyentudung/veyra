@@ -7,14 +7,13 @@ use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
-pub use veyra_video::Snapshot;
-pub use veyra_video::VideoFrame;
-use veyra_video::{Command, GpuContext};
+use veyra_video::{Command, FrameMailbox, FrameWaker, GpuContext};
+pub use veyra_video::{Snapshot, VideoFrame};
 
 pub struct Engine {
     tx: mpsc::Sender<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
-    frame: Arc<Mutex<Option<VideoFrame>>>,
+    frame: Arc<FrameMailbox>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -25,7 +24,7 @@ impl Engine {
             volume: 100.0,
             ..Default::default()
         }));
-        let frame = Arc::new(Mutex::new(None));
+        let frame = Arc::new(FrameMailbox::default());
         let worker_snapshot = Arc::clone(&snapshot);
         let worker_frame = Arc::clone(&frame);
         let worker = thread::Builder::new()
@@ -68,12 +67,18 @@ impl Engine {
     pub fn set_gpu_context(&self, context: GpuContext) {
         let _ = self.tx.send(Command::GpuContext(context));
     }
+    /// Makes the media worker wake the UI when a source-paced frame or a
+    /// playback-state change is ready. The callback is coalesced by the
+    /// one-frame mailbox so a fast decoder cannot flood the event loop.
+    pub fn set_waker(&self, waker: FrameWaker) {
+        self.frame.set_waker(waker);
+    }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().unwrap().clone()
     }
     /// Takes the newest frame, leaving the worker with a bounded one-frame slot.
     pub fn take_latest_frame(&self) -> Option<VideoFrame> {
-        self.frame.lock().unwrap().take()
+        self.frame.take_latest()
     }
 }
 

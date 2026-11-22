@@ -4,7 +4,7 @@
 
 - Container opening and stream discovery: **Implemented**.
 - Audio/video packet decoding: **Implemented**.
-- Software video conversion and Rune native-surface frame handoff: **Implemented**.
+- Direct YUV GPU handoff with software conversion fallback: **Implemented**.
 - ALSA output and basic volume/mute scaling: **Partially Implemented**.
 - Pause and command plumbing: **Partially Implemented**.
 - Timestamp-based video pacing, duration reporting, and seek clock reset: **Implemented; real-media verification still needed**.
@@ -22,13 +22,13 @@
 
 ## Video path
 
-`video/rendering/decoder.rs` drains decoded frames. `video/rendering/renderer.rs` lazily creates a libswscale context targeting BGRA and moves converted bytes into `video/rendering/frame.rs::VideoFrame`; Rune consumes that allocation through `NativeSurface`. The latest frame is shared with the UI through a bounded one-frame slot, and timestamp pacing occurs before publication.
+`video/rendering/decoder.rs` drains decoded frames. The default renderer uploads Y/UV planes directly to Rune's compositor for YUV420P/NV12 frames; unsupported formats and GPU failures fall back to libswscale BGRA conversion. The latest frame is shared with the UI through a bounded one-frame mailbox, and timestamp pacing occurs before publication.
 
 ## Timing
 
-Video frames now use `best_effort_timestamp` (falling back to `pts`) multiplied by the decoded stream time base. `PresentationClock` anchors the first timestamp to `Instant` and waits until each subsequent frame's presentation deadline before publishing it to the latest-frame slot. This prevents video-only files from being decoded and displayed as fast as the worker can process packets. Opening a file creates a fresh clock; seeking resets the clock after the demuxer and codec state are flushed.
+Video frames now use `best_effort_timestamp` (falling back to `pts`) multiplied by the decoded stream time base. `PresentationClock` anchors the first timestamp to `Instant` and waits until each subsequent frame's presentation deadline before publishing it to the latest-frame mailbox. The mailbox coalesces UI wakeups, so presentation follows source frame arrival instead of a fixed UI polling cadence; a 60 FPS source is no longer capped by a 33 ms timer. Paused, idle, and audio-only state uses a 250 ms status refresh. Opening a file creates a fresh clock; seeking resets the clock after the demuxer and codec state are flushed.
 
-The current implementation keeps Veyra's existing lightweight architecture and does not copy mpv code or add libmpv. The host has libmpv development headers and pkg-config metadata, but Rune's public surface API still requires a CPU byte frame; the concrete rendering investigation is recorded in `docs/libmpv-rendering.md`. Audio output remains ALSA-paced, while video-only playback uses the timestamp clock. The latest-wins frame slot bounds memory, and presentation happens on the worker before the UI consumes the frame, so the UI thread is not responsible for pacing or decoding. A future profiling pass can add late-frame dropping and a shared audio master clock if real media testing shows that they are needed. No C implementation was reused beyond the existing FFmpeg, swscale, swresample, and ALSA libraries already integrated by Veyra.
+The current implementation keeps Veyra's existing lightweight architecture and does not copy mpv code or add libmpv. The host has libmpv development headers and pkg-config metadata, but Rune's public surface API still requires a CPU byte frame; the concrete rendering investigation is recorded in `docs/libmpv-rendering.md`. Audio output remains ALSA-paced, while video-only playback uses the timestamp clock. The latest-wins frame mailbox bounds memory, and the UI receives only coalesced readiness signals; it does not decode or rebuild the full playback chrome at the video's cadence. Statistics materialization is similarly limited to 250 ms intervals while render-frame accounting remains per frame. A future profiling pass can add late-frame dropping and a shared audio master clock if real media testing shows that they are needed. No C implementation was reused beyond the existing FFmpeg, swscale, swresample, and ALSA libraries already integrated by Veyra.
 
 ## Controls and lifecycle
 

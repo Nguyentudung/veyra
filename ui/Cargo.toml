@@ -1,12 +1,15 @@
 [package]
 name = "veyra-ui"
-version = "0.0.23"
+version = "0.0.24"
 edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-# Rune is vendored with its license and local GPU bridge under third_party.
-rune = { path = "../third_party/rune/crates/rune" }
+# Veyra decodes all media with FFmpeg and draws its icons directly, so Rune's
+# optional Ogg audio and SVG image stacks only add unused code and resources.
+# Retain the desktop features Veyra actually exposes: bundled fallback fonts,
+# system theme integration, and accessibility.
+rune = { path = "../third_party/rune/crates/rune", default-features = false, features = ["accessibility", "dbus", "embedded-fonts"] }
 rune-kit = { path = "../third_party/rune/crates/rune-kit" }
 veyra-playback = { path = "../playback" }
 veyra-playlist = { path = "../playlist" }

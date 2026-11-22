@@ -11,8 +11,12 @@ use rune::{
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, PaletteSeed,
 };
-use std::{path::PathBuf, process::Command, time::Duration};
-use veyra_playback::{Engine, VideoFrame};
+use std::{
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
+use veyra_playback::{Engine, Snapshot, VideoFrame};
 use veyra_playlist::{Playlist, is_probably_media};
 use veyra_scripting::{PlaybackEvent, ScriptManager};
 use veyra_statistics::{StatisticsCollector, StatisticsSnapshot};
@@ -28,8 +32,19 @@ mod theme;
 mod titlebar;
 mod top_bar;
 
+// Frame delivery is event-driven. This timer only refreshes state that has no
+// video frame to wake it (audio-only playback, errors, and idle UI state).
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+// The native surface can present a new frame without rebuilding the entire
+// controls tree. Refresh controls and the timeline at this cadence instead.
+const UI_STATE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+// Materializing a public statistics snapshot clones history and metadata, so
+// keep it aligned with the collector's 250 ms history cadence.
+const STATISTICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+
 pub struct State {
     engine: Engine,
+    snapshot: Snapshot,
     playlist: Playlist,
     surface: NativeSurface,
     status: String,
@@ -46,6 +61,8 @@ pub struct State {
     statistics_open: bool,
     collector: StatisticsCollector,
     statistics: StatisticsSnapshot,
+    next_ui_refresh: Instant,
+    next_statistics_sample: Instant,
     scripts: ScriptManager,
     last_file_name: Option<String>,
     statistics_page: usize,
@@ -67,8 +84,10 @@ pub fn run() {
 
 impl State {
     fn new() -> Self {
-        Self {
-            engine: Engine::new(),
+        let engine = Engine::new();
+        let mut state = Self {
+            snapshot: engine.snapshot(),
+            engine,
             playlist: Playlist::default(),
             surface: NativeSurface::new(),
             status: "Open a media file to begin".into(),
@@ -85,6 +104,8 @@ impl State {
             statistics_open: false,
             collector: StatisticsCollector::new(),
             statistics: StatisticsSnapshot::default(),
+            next_ui_refresh: Instant::now(),
+            next_statistics_sample: Instant::now(),
             scripts: ScriptManager::new(StatisticsSnapshot::default()),
             last_file_name: None,
             statistics_page: 0,
@@ -92,19 +113,30 @@ impl State {
             gpu_generation: None,
             lua_console_open: false,
             lua_console_input: TextEdit::default(),
+        };
+        // Allows repeatable, non-interactive playback profiling without
+        // changing the normal file-picker workflow. It is intentionally
+        // opt-in so regular launches still start on the empty state.
+        if let Some(path) = std::env::var_os("VEYRA_OPEN_MEDIA") {
+            open_path(&mut state, PathBuf::from(path));
         }
+        state
     }
 }
 
 fn setup(state: &mut State, waker: Waker) {
-    state.surface.set_waker(waker);
+    // The worker signals only when a source-paced frame or playback state is
+    // ready. `NativeSurface` is pushed from `poll`, so registering its waker
+    // too would schedule a redundant empty UI turn after every frame.
+    state.engine.set_waker(waker);
 }
 
 fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    // Video is presented when a new frame arrives. Polling at the source's
-    // ~30 FPS cadence avoids composing the same NativeSurface frame twice on
-    // a 60 Hz timer; input and surface wakers still redraw immediately.
-    tx.wake_after(Duration::from_millis(33));
+    // The decoder already PTS-paces each frame and wakes us through the
+    // mailbox. Do not impose a second fixed 30 FPS timer: it drops 60 FPS
+    // sources and creates needless wakeups while paused or idle.
+    tx.wake_after(STATUS_POLL_INTERVAL);
+    let now = Instant::now();
     let mut changed = false;
     let generation = state.surface.gpu_generation();
     if state.gpu_generation != generation {
@@ -113,8 +145,20 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
         state.gpu_generation = generation;
     }
+    let mut snapshot = state.engine.snapshot();
+    let stream_changed = state.last_file_name != snapshot.file_name;
+    if stream_changed {
+        // Statistics belong to one media stream. Reset before recording the
+        // first rendered frame so a new track never inherits old history.
+        state.collector.reset_stream();
+    }
+    state
+        .collector
+        .set_active(!snapshot.paused && !snapshot.finished);
     if let Some(frame) = state.engine.take_latest_frame() {
+        let timestamp = frame.timestamp();
         state.collector.record_rendered_frame();
+        let first_frame = state.frame_id == 0;
         state.frame_id = state.frame_id.wrapping_add(1);
         let result = match frame {
             VideoFrame::Bytes {
@@ -139,19 +183,34 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         };
         if let Err(error) = result {
             state.status = error;
+            changed = true;
         }
-        changed = true;
+        snapshot.position = timestamp;
+        // The existing NativeSurface is read during this same Rune paint, so
+        // later frames need no state commit or full UI-tree rebuild. The first
+        // one does, because it mounts the surface in place of the empty view.
+        changed |= first_frame;
     }
-    let snapshot = state.engine.snapshot();
-    state
-        .collector
-        .set_active(!snapshot.paused && !snapshot.finished);
-    state.statistics = state.collector.sample(
-        &snapshot,
-        state.playlist.current_track().map(|t| t.path.as_path()),
-    );
-    if state.last_file_name != snapshot.file_name {
-        state.collector.reset_stream();
+    let position_jumped = (snapshot.position - state.last_position).abs() > 1.0;
+    let duration_changed = state.last_duration != snapshot.duration;
+    let video_size_changed = state.snapshot.video_width != snapshot.video_width
+        || state.snapshot.video_height != snapshot.video_height;
+    let playback_state_changed = state.last_paused != snapshot.paused
+        || state.last_finished != snapshot.finished
+        || state.last_muted != snapshot.muted
+        || state.last_error != snapshot.error;
+    if stream_changed
+        || position_jumped
+        || playback_state_changed
+        || now >= state.next_statistics_sample
+    {
+        state.statistics = state.collector.sample(
+            &snapshot,
+            state.playlist.current_track().map(|t| t.path.as_path()),
+        );
+        state.next_statistics_sample = now + STATISTICS_SAMPLE_INTERVAL;
+    }
+    if stream_changed {
         if snapshot.file_name.is_some() {
             let event = if state.last_file_name.is_some() {
                 PlaybackEvent::TrackChanged {
@@ -164,7 +223,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
         state.last_file_name = snapshot.file_name.clone();
     }
-    if (snapshot.position - state.last_position).abs() > 1.0 && snapshot.file_name.is_some() {
+    if position_jumped && snapshot.file_name.is_some() {
         state.scripts.dispatch(
             PlaybackEvent::Seeked {
                 position: snapshot.position,
@@ -187,23 +246,25 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             .scripts
             .dispatch(PlaybackEvent::Finished, state.statistics.clone());
     }
-    if state.last_paused != snapshot.paused
-        || state.last_muted != snapshot.muted
-        || state.last_error != snapshot.error
-        || (state.last_position - snapshot.position).abs() > 0.02
-        || state.last_duration != snapshot.duration
-    {
-        state.last_paused = snapshot.paused;
-        state.last_finished = snapshot.finished;
-        state.last_muted = snapshot.muted;
-        state.last_error = snapshot.error.clone();
-        state.last_position = snapshot.position;
-        state.last_duration = snapshot.duration;
-        if let Some(error) = snapshot.error {
+    let ui_refresh_due = now >= state.next_ui_refresh;
+    if playback_state_changed || stream_changed || video_size_changed || duration_changed || ui_refresh_due {
+        if let Some(error) = snapshot.error.clone() {
             state.status = error;
         }
         changed = true;
+        state.next_ui_refresh = now + UI_STATE_REFRESH_INTERVAL;
     }
+    // Keep event detection exact on every source frame, even though the
+    // visible timeline is deliberately refreshed at a lower cadence.
+    state.last_paused = snapshot.paused;
+    state.last_finished = snapshot.finished;
+    state.last_muted = snapshot.muted;
+    state.last_error = snapshot.error.clone();
+    state.last_position = snapshot.position;
+    state.last_duration = snapshot.duration;
+    // Views read this cache instead of repeatedly locking and cloning the
+    // worker snapshot during every video frame.
+    state.snapshot = snapshot;
     changed
 }
 
@@ -288,9 +349,8 @@ fn view(state: &State, cx: &mut Cx<State>) -> El {
 
 fn video_view(state: &State, kit: &Kit) -> El {
     let surface = if state.frame_id > 0 {
-        let snapshot = state.engine.snapshot();
-        let ratio = (snapshot.video_width > 0 && snapshot.video_height > 0)
-            .then_some(snapshot.video_width as f32 / snapshot.video_height as f32);
+        let ratio = (state.snapshot.video_width > 0 && state.snapshot.video_height > 0)
+            .then_some(state.snapshot.video_width as f32 / state.snapshot.video_height as f32);
         let video = ratio.map_or_else(
             || el().w_full().h_full(),
             |ratio| el().w_full().h_full().aspect_fit(ratio),
@@ -383,6 +443,7 @@ fn volume_control(state: &State, kit: &Kit) -> El {
     } else {
         el()
     };
+    let muted = state.snapshot.muted;
     col()
         // The mute capsule is 44 px tall while the playback capsule is 52 px tall.
         // Align their centers by giving the shorter capsule 8 px more bottom inset.
@@ -392,27 +453,18 @@ fn volume_control(state: &State, kit: &Kit) -> El {
         .on_hover_change(|s: &mut State, inside, _| s.volume_hovered = inside)
         .child(slider)
         .child(glass_capsule(
-            IconButton::new(if state.engine.snapshot().muted {
-                &VOLUME_X
-            } else {
-                &VOLUME_2
-            })
-            .label(if state.engine.snapshot().muted {
-                "Unmute"
-            } else {
-                "Mute"
-            })
-            .variant(IconButtonVariant::GhostMuted)
-            .control_size(ControlSize::Large)
-            .on_press(|s: &mut State| s.engine.toggle_mute())
-            .build(kit)
-            .radius(999.0),
+            IconButton::new(if muted { &VOLUME_X } else { &VOLUME_2 })
+                .label(if muted { "Unmute" } else { "Mute" })
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Large)
+                .on_press(|s: &mut State| s.engine.toggle_mute())
+                .build(kit)
+                .radius(999.0),
         ))
 }
 
 fn controls(state: &State, kit: &Kit) -> El {
-    let snapshot = state.engine.snapshot();
-    let playing = state.frame_id > 0 && !snapshot.paused;
+    let playing = state.frame_id > 0 && !state.snapshot.paused;
     let play_icon = if playing { &PAUSE } else { &PLAY };
     let transport = row()
         .gap(10.0)
@@ -480,7 +532,7 @@ fn controls(state: &State, kit: &Kit) -> El {
 }
 
 fn timeline(state: &State, kit: &Kit) -> El {
-    let snapshot = state.engine.snapshot();
+    let snapshot = &state.snapshot;
     let progress = snapshot
         .duration
         .filter(|duration| *duration > 0.0)

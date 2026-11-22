@@ -73,6 +73,10 @@ impl StatisticsCollector {
         }
     }
     pub fn reset_stream(&mut self) {
+        self.history.clear();
+        self.frame_history.clear();
+        self.aggregator.clear();
+        self.last = Instant::now();
         self.last_render = None;
         self.render_window = Instant::now();
         self.rendered_frames = 0;

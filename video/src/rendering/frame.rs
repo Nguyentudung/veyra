@@ -24,7 +24,7 @@ pub enum VideoFrame {
 }
 
 impl VideoFrame {
-    pub(crate) fn timestamp(&self) -> f64 {
+    pub fn timestamp(&self) -> f64 {
         match self {
             Self::Bytes { timestamp, .. }
             | Self::Gpu { timestamp, .. }

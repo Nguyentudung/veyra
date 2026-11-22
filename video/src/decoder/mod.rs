@@ -3,8 +3,9 @@ mod demuxer;
 mod seek;
 
 use super::{
+    FrameMailbox,
     audio::{self, AudioOutput},
-    rendering::{self, VideoFrame},
+    rendering,
     state::Snapshot,
 };
 use codec::Codec;
@@ -112,7 +113,7 @@ impl Decoder {
     pub(crate) fn step(
         &mut self,
         snapshot: &Arc<Mutex<Snapshot>>,
-        frame_out: &Arc<Mutex<Option<VideoFrame>>>,
+        frame_out: &Arc<FrameMailbox>,
     ) -> Result<(), String> {
         unsafe {
             let stream = match self.demuxer.read_packet() {
@@ -177,14 +178,14 @@ impl Decoder {
         &mut self,
         target: f64,
         snapshot: &Arc<Mutex<Snapshot>>,
-        frame_out: &Arc<Mutex<Option<VideoFrame>>>,
+        frame_out: &Arc<FrameMailbox>,
     ) -> Result<(), String> {
         let duration = snapshot.lock().unwrap().duration;
         let target = target.max(0.0).min(duration.unwrap_or(f64::MAX));
         self.seek_absolute(target)?;
         self.presentation_clock.reset();
         self.renderer.reset_pending();
-        *frame_out.lock().unwrap() = None;
+        frame_out.clear();
         snapshot.lock().unwrap().position = target;
         Ok(())
     }

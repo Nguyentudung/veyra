@@ -140,6 +140,9 @@ impl Drop for SoftwareRenderer {
 }
 
 pub(crate) enum VideoRenderer {
+    /// Temporary ownership placeholder while a renderer is processed. Keeping
+    /// this allocation-free matters on the per-frame GPU path.
+    Vacant,
     Software(SoftwareRenderer),
     Vulkan(GpuRenderer),
     /// Software is used only until Rune has prepared this surface and exposed
@@ -180,23 +183,30 @@ impl VideoRenderer {
                     Self::Software(SoftwareRenderer::new())
                 }
             },
-            Ok("software") | Err(_) => {
+            Ok("software") => {
                 eprintln!(
-                    "[video] renderer=software (default; set VEYRA_VIDEO_RENDERER=gpu-video for direct NV12 presentation)"
+                    "[video] renderer=software (explicit fallback; gpu-video is the default)"
                 );
                 Self::Software(SoftwareRenderer::new())
             }
+            Err(_) => {
+                // Direct Y/UV handoff avoids a full CPU BGRA frame and its
+                // subsequent upload. Unsupported formats and GPU failures
+                // already fall back locally to the software renderer.
+                eprintln!("[video] renderer=gpu-video (default; awaiting Rune GPU context)");
+                Self::GpuVideoPending(SoftwareRenderer::new())
+            }
             Ok(value) => {
                 eprintln!(
-                    "[video] unknown VEYRA_VIDEO_RENDERER={value:?}; using software (valid: software, gpu-video, gpu-native, vulkan-readback)"
+                    "[video] unknown VEYRA_VIDEO_RENDERER={value:?}; using gpu-video (valid: software, gpu-video, gpu-native, vulkan-readback)"
                 );
-                Self::Software(SoftwareRenderer::new())
+                Self::GpuVideoPending(SoftwareRenderer::new())
             }
         }
     }
 
     pub(crate) fn set_gpu_context(&mut self, context: GpuContext) {
-        let current = std::mem::replace(self, Self::Software(SoftwareRenderer::new()));
+        let current = std::mem::replace(self, Self::Vacant);
         match current {
             Self::GpuNativePending(_) => match NativeGpuRenderer::new(context) {
                 Ok(renderer) => {
@@ -250,6 +260,7 @@ impl VideoRenderer {
                     }
                 }
             }
+            Self::Vacant => unreachable!("renderer is only vacant while being replaced"),
             renderer => *self = renderer,
         }
     }
@@ -261,8 +272,9 @@ impl VideoRenderer {
     ) -> Result<Option<VideoFrame>, String> {
         // Keep fallback local to the renderer: an unusual pixel format or a
         // device loss must not stop playback or tear down the decoder.
-        let current = std::mem::replace(self, Self::Software(SoftwareRenderer::new()));
+        let current = std::mem::replace(self, Self::Vacant);
         match current {
+            Self::Vacant => unreachable!("renderer is only vacant while converting a frame"),
             Self::Software(mut renderer) => {
                 let result = renderer.convert(frame);
                 *self = Self::Software(renderer);
@@ -434,6 +446,7 @@ impl VideoRenderer {
 
     pub(crate) fn poll_completed(&mut self) -> Result<Option<VideoFrame>, String> {
         match self {
+            Self::Vacant => unreachable!("renderer is only vacant while converting a frame"),
             Self::Software(_) => Ok(None),
             Self::Vulkan(renderer) => renderer.poll_completed(),
             Self::GpuNativePending(_)
@@ -445,6 +458,7 @@ impl VideoRenderer {
 
     pub(crate) fn finish_pending(&mut self) -> Result<Option<VideoFrame>, String> {
         match self {
+            Self::Vacant => unreachable!("renderer is only vacant while converting a frame"),
             Self::Software(_) => Ok(None),
             Self::Vulkan(renderer) => renderer.finish_pending(),
             Self::GpuNativePending(_)
@@ -455,8 +469,10 @@ impl VideoRenderer {
     }
 
     pub(crate) fn reset_pending(&mut self) {
-        if let Self::Vulkan(renderer) = self {
-            renderer.reset_pending();
+        match self {
+            Self::Vulkan(renderer) => renderer.reset_pending(),
+            Self::Vacant => unreachable!("renderer is only vacant while converting a frame"),
+            _ => {}
         }
     }
 }

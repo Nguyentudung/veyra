@@ -22,6 +22,10 @@ impl History {
     pub fn values(&self) -> Vec<f64> {
         self.values.iter().copied().collect()
     }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
 }
 
 #[cfg(test)]
