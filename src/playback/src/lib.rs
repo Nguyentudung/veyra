@@ -8,7 +8,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 use veyra_video::{Command, FrameMailbox, FrameWaker, GpuContext};
-pub use veyra_video::{Snapshot, VideoFrame};
+pub use veyra_video::{FrameUpdate, Snapshot, VideoFrame};
 
 pub struct Engine {
     tx: mpsc::Sender<Command>,
@@ -75,6 +75,13 @@ impl Engine {
     }
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().unwrap().clone()
+    }
+    /// Takes the newest source-paced frame together with whether the worker
+    /// changed playback state. The UI can skip cloning its full snapshot for
+    /// ordinary video frames while still applying pause/seek/error changes at
+    /// once.
+    pub fn take_frame_update(&self) -> FrameUpdate {
+        self.frame.take_update()
     }
     /// Takes the newest frame, leaving the worker with a bounded one-frame slot.
     pub fn take_latest_frame(&self) -> Option<VideoFrame> {

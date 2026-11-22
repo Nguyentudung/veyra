@@ -2,7 +2,7 @@
 
 ## Scope and result
 
-This report describes the implementation currently in the repository. Veyra uses one Rust worker thread around a custom FFmpeg/ALSA pipeline. Rune owns the UI and accepts video as CPU BGRA byte frames. libmpv is installed on the host, but is not linked into Veyra and has not replaced the current engine.
+This report describes the implementation currently in the repository. Veyra uses one Rust worker thread around a custom FFmpeg/ALSA pipeline. Rune owns the UI and accepts direct GPU YUV frames where available, with CPU BGRA bytes as the software fallback. libmpv is installed on the host, but is not linked into Veyra and has not replaced the current engine.
 
 The audit found two concrete audio configuration defects: libswresample always produced stereo S16 at 48 kHz, while ALSA was configured from the input frame rate and source channel count. This could play audio at the wrong speed and send a stereo buffer to a PCM configured for a different frame width. ALSA now uses the fixed 48 kHz, two-channel output format. PCM write failures are no longer ignored; recoverable errors use `snd_pcm_recover` and unrecoverable errors reach the worker error state. The audit also found that timeline drags were sending relative seeks based on a stale snapshot; timeline input now sends absolute targets.
 
@@ -15,12 +15,12 @@ Real media playback and A/V measurements were not available in this headless run
 3. `Decoder::open` calls `avformat_open_input` and `avformat_find_stream_info` in `decoder/demuxer.rs`, allocates one `AVPacket`, and calls `av_find_best_stream` for video in `decoder/codec.rs`.
 4. Codec parameters are copied with `avcodec_parameters_to_context`, then the codec is opened with `avcodec_open2`.
 5. The worker repeatedly calls `av_read_frame`. Video packets are sent with `avcodec_send_packet`; decoded frames are drained with `avcodec_receive_frame`.
-6. `video/renderer.rs` lazily creates a `SwsContext` and calls `sws_scale` to convert the decoded format to BGRA at the source dimensions. A new `Vec<u8>` of `width * height * 4` bytes is allocated for each converted frame.
+6. `src/video/src/rendering/gpu_video.rs` uploads Y/UV planes from YUV420P/NV12 frames to Rune's shared GPU context. `src/video/src/rendering/renderer.rs` lazily creates a `SwsContext` and calls `sws_scale` only for unsupported formats or GPU fallback.
 7. `best_effort_timestamp`, falling back to `pts`, is converted using the selected stream time base. `PresentationClock` uses `Instant` and sleeps until the timestamp deadline before publishing.
-8. The worker stores one `VideoFrame` in `Arc<Mutex<Option<VideoFrame>>>`. Publishing replaces the previous unconsumed frame, so the queue is bounded at one and is latest-wins.
-9. `ui::poll` takes the frame, wraps the BGRA allocation in `ByteFrame`, and calls `NativeSurface::push_bytes`. Rune's surface renderer uploads the byte frame through its own renderer and displays it with `SurfaceFit::Fit`.
+8. The worker stores one `VideoFrame` in `FrameMailbox`. Publishing replaces the previous unconsumed frame, so the queue is bounded at one and is latest-wins; source-frame wakes are coalesced.
+9. `ui::poll` takes the frame and calls `NativeSurface::push_gpu_video` for direct YUV frames or `push_bytes` for the fallback. Rune displays it with `SurfaceFit::Fit`.
 
-The video path is CPU decode, CPU swscale conversion, CPU allocation, then a Rune native-surface upload. It is not a direct GPU decoder or zero-copy path.
+The default video path is CPU decode, direct YUV upload to Rune's compositor, then GPU presentation. It is not a hardware decoder or an FFmpeg-to-wgpu zero-copy path; the software fallback still performs CPU conversion and allocation.
 
 ## Audio pipeline
 

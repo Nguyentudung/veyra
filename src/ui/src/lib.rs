@@ -132,12 +132,24 @@ fn setup(state: &mut State, waker: Waker) {
 }
 
 fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
-    // The decoder already PTS-paces each frame and wakes us through the
-    // mailbox. Do not impose a second fixed 30 FPS timer: it drops 60 FPS
-    // sources and creates needless wakeups while paused or idle.
-    tx.wake_after(STATUS_POLL_INTERVAL);
     let now = Instant::now();
-    let mut changed = false;
+    let update = state.engine.take_frame_update();
+    let ui_refresh_due = now >= state.next_ui_refresh;
+    // Ordinary video frames only update the native surface. Cloning metadata
+    // and rebuilding chrome at 60 Hz was avoidable CPU/allocator traffic.
+    // State-only wakes are tagged by the mailbox, so pause/seek/error still
+    // refresh immediately; the timer keeps audio-only playback current.
+    let refresh_snapshot = update.state_changed || ui_refresh_due;
+    if !refresh_snapshot {
+        return if let Some(frame) = update.frame {
+            let (timestamp, changed) = present_frame(state, frame);
+            state.snapshot.position = timestamp;
+            changed
+        } else {
+            false
+        };
+    }
+
     let generation = state.surface.gpu_generation();
     if state.gpu_generation != generation {
         if let Some(context) = state.surface.gpu_context() {
@@ -145,6 +157,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         }
         state.gpu_generation = generation;
     }
+    let mut changed = false;
     let mut snapshot = state.engine.snapshot();
     let stream_changed = state.last_file_name != snapshot.file_name;
     if stream_changed {
@@ -155,41 +168,10 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     state
         .collector
         .set_active(!snapshot.paused && !snapshot.finished);
-    if let Some(frame) = state.engine.take_latest_frame() {
-        let timestamp = frame.timestamp();
-        state.collector.record_rendered_frame();
-        let first_frame = state.frame_id == 0;
-        state.frame_id = state.frame_id.wrapping_add(1);
-        let result = match frame {
-            VideoFrame::Bytes {
-                rgba,
-                width,
-                height,
-                ..
-            } => state.surface.push_bytes(
-                ByteFrame {
-                    width,
-                    height,
-                    format: Format::Bgra,
-                    color: ColorInfo::default(),
-                    planes: [rgba, Vec::new()],
-                },
-                state.frame_id,
-            ),
-            VideoFrame::Gpu { frame, .. } => state.surface.push_gpu(frame, state.frame_id),
-            VideoFrame::GpuVideo { frame, .. } => {
-                state.surface.push_gpu_video(frame, state.frame_id)
-            }
-        };
-        if let Err(error) = result {
-            state.status = error;
-            changed = true;
-        }
+    if let Some(frame) = update.frame {
+        let (timestamp, frame_changed) = present_frame(state, frame);
         snapshot.position = timestamp;
-        // The existing NativeSurface is read during this same Rune paint, so
-        // later frames need no state commit or full UI-tree rebuild. The first
-        // one does, because it mounts the surface in place of the empty view.
-        changed |= first_frame;
+        changed |= frame_changed;
     }
     let position_jumped = (snapshot.position - state.last_position).abs() > 1.0;
     let duration_changed = state.last_duration != snapshot.duration;
@@ -246,16 +228,20 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             .scripts
             .dispatch(PlaybackEvent::Finished, state.statistics.clone());
     }
-    let ui_refresh_due = now >= state.next_ui_refresh;
-    if playback_state_changed || stream_changed || video_size_changed || duration_changed || ui_refresh_due {
+    if playback_state_changed
+        || stream_changed
+        || video_size_changed
+        || duration_changed
+        || ui_refresh_due
+    {
         if let Some(error) = snapshot.error.clone() {
             state.status = error;
         }
         changed = true;
         state.next_ui_refresh = now + UI_STATE_REFRESH_INTERVAL;
     }
-    // Keep event detection exact on every source frame, even though the
-    // visible timeline is deliberately refreshed at a lower cadence.
+    // State-marked mailbox updates refresh immediately; the periodic path
+    // refreshes the timeline and statistics without per-frame snapshot work.
     state.last_paused = snapshot.paused;
     state.last_finished = snapshot.finished;
     state.last_muted = snapshot.muted;
@@ -263,9 +249,65 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     state.last_position = snapshot.position;
     state.last_duration = snapshot.duration;
     // Views read this cache instead of repeatedly locking and cloning the
-    // worker snapshot during every video frame.
+    // worker snapshot during ordinary video frames.
     state.snapshot = snapshot;
+    // Schedule only when this snapshot path ran. Re-arming a 250 ms fallback
+    // on every 60 FPS source frame needlessly maintained many redundant
+    // deadlines in Rune's event loop.
+    let until_refresh = state.next_ui_refresh.saturating_duration_since(now);
+    tx.wake_after(until_refresh.min(STATUS_POLL_INTERVAL));
     changed
+}
+
+/// Publishes a source-paced frame to Rune's native surface. The surface is
+/// sampled during the same paint, so only its first frame needs a full view
+/// commit to replace the empty-state UI.
+fn present_frame(state: &mut State, frame: VideoFrame) -> (f64, bool) {
+    let timestamp = frame.timestamp();
+    state.collector.record_rendered_frame();
+    let first_frame = state.frame_id == 0;
+    state.frame_id = state.frame_id.wrapping_add(1);
+    let result = match frame {
+        VideoFrame::Bytes {
+            rgba,
+            width,
+            height,
+            ..
+        } => state.surface.push_bytes(
+            ByteFrame {
+                width,
+                height,
+                format: Format::Bgra,
+                color: ColorInfo::default(),
+                planes: [rgba, Vec::new()],
+            },
+            state.frame_id,
+        ),
+        VideoFrame::Gpu { frame, .. } => state.surface.push_gpu(frame, state.frame_id),
+        VideoFrame::GpuVideo { frame, .. } => state.surface.push_gpu_video(frame, state.frame_id),
+    };
+    let mut changed = first_frame;
+    match result {
+        Ok(()) if first_frame => mark_benchmark_ready(),
+        Ok(()) => {}
+        Err(error) => {
+            state.status = error;
+            changed = true;
+        }
+    }
+    (timestamp, changed)
+}
+
+/// Benchmark tooling opts in to this marker with a unique temporary path.
+/// It records the moment Veyra has accepted its first video frame, which is a
+/// useful common startup boundary with mpv's `vo-configured` IPC property.
+fn mark_benchmark_ready() {
+    let Some(path) = std::env::var_os("VEYRA_BENCHMARK_READY_FILE") else {
+        return;
+    };
+    if let Err(error) = std::fs::write(path, b"ready\n") {
+        eprintln!("[benchmark] could not write Veyra ready marker: {error}");
+    }
 }
 
 fn on_key(state: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {

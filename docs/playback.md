@@ -12,17 +12,17 @@
 
 ## Opening and demuxing
 
-`src/ui/mod.rs` invokes the Linux `zenity` chooser, applies the extension filter in `playlist::is_probably_media`, adds the track, and sends `Engine::open`. `video/decoder/demuxer.rs` calls `avformat_open_input`, `avformat_find_stream_info`, allocates one `AVPacket`, and reads packets with `av_read_frame`.
+`src/ui/src/lib.rs` invokes the Linux `zenity` chooser, applies the extension filter in `playlist::is_probably_media`, adds the track, and sends `Engine::open`. `src/video/src/decoder/demuxer.rs` calls `avformat_open_input`, `avformat_find_stream_info`, allocates one `AVPacket`, and reads packets with `av_read_frame`.
 
-`video/decoder/codec.rs` calls `av_find_best_stream` for audio and video, copies codec parameters into contexts, and opens decoders. `Decoder::step` routes packets by stream index and unreferences them after processing.
+`src/video/src/decoder/codec.rs` calls `av_find_best_stream` for audio and video, copies codec parameters into contexts, and opens decoders. `Decoder::step` routes packets by stream index and unreferences them after processing.
 
 ## Audio path
 
-`video/audio/decoder.rs` uses `avcodec_send_packet`/`avcodec_receive_frame`, then creates an `AudioOutput` on the first frame. `audio/resampler.rs` configures libswresample for stereo, 48 kHz, S16 output. `audio/decoder.rs` applies snapshot volume/mute scaling and writes interleaved samples through ALSA. `audio/output.rs` owns device and resampler cleanup. ALSA is configured for the actual resampler output: 48 kHz, two channels, S16 little endian. The earlier source-channel configuration could mismatch the stereo buffer for mono or multichannel media. PCM write errors are now surfaced, and recoverable ALSA errors are retried through `snd_pcm_recover` with bounded diagnostics.
+`src/video/src/audio/decoder.rs` uses `avcodec_send_packet`/`avcodec_receive_frame`, then creates an `AudioOutput` on the first frame. `audio/resampler.rs` configures libswresample for stereo, 48 kHz, S16 output. `audio/decoder.rs` applies snapshot volume/mute scaling and writes interleaved samples through ALSA. `audio/output.rs` owns device and resampler cleanup. ALSA is configured for the actual resampler output: 48 kHz, two channels, S16 little endian. The earlier source-channel configuration could mismatch the stereo buffer for mono or multichannel media. PCM write errors are now surfaced, and recoverable ALSA errors are retried through `snd_pcm_recover` with bounded diagnostics.
 
 ## Video path
 
-`video/rendering/decoder.rs` drains decoded frames. The default renderer uploads Y/UV planes directly to Rune's compositor for YUV420P/NV12 frames; unsupported formats and GPU failures fall back to libswscale BGRA conversion. The latest frame is shared with the UI through a bounded one-frame mailbox, and timestamp pacing occurs before publication.
+`src/video/src/rendering/decoder.rs` drains decoded frames. The default renderer uploads Y/UV planes directly to Rune's compositor for YUV420P/NV12 frames; unsupported formats and GPU failures fall back to libswscale BGRA conversion. The latest frame is shared with the UI through a bounded one-frame mailbox, and timestamp pacing occurs before publication.
 
 ## Timing
 
@@ -32,7 +32,7 @@ The current implementation keeps Veyra's existing lightweight architecture and d
 
 ## Controls and lifecycle
 
-`video/commands.rs` carries open, pause, seek, volume, mute, and stop commands. `video/worker.rs` replaces the decoder on open, toggles the worker loop on pause, flushes codecs on seek, and joins on engine drop. End of input currently becomes an error-like completion state rather than automatically advancing the playlist.
+`src/video/src/commands.rs` carries open, pause, seek, volume, mute, and stop commands. `src/video/src/worker.rs` replaces the decoder on open, toggles the worker loop on pause, flushes codecs on seek, and joins on engine drop. End of input currently becomes an error-like completion state rather than automatically advancing the playlist.
 
 Relative seek resolves the requested delta against the current snapshot position. Timeline interaction uses a separate absolute `SeekTo` command, so repeated drag events do not accumulate deltas against a stale position. Both paths call `avformat_seek_file` in AV_TIME_BASE units, call `avformat_flush`, flush audio/video codec buffers, discard the pending video frame, drop queued ALSA samples, and reset the presentation clock. `Snapshot.position` and `duration` are populated from the worker loop.
 

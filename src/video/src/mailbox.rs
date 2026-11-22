@@ -10,6 +10,16 @@ use std::sync::{Arc, Mutex};
 
 pub type FrameWaker = Arc<dyn Fn() + Send + Sync>;
 
+/// One atomic delivery from the media worker to the UI thread.
+///
+/// A frame is source-paced and can be presented without rebuilding playback
+/// controls. State-only changes, such as pause or seek, require a fresh
+/// snapshot immediately.
+pub struct FrameUpdate {
+    pub frame: Option<VideoFrame>,
+    pub state_changed: bool,
+}
+
 #[derive(Default)]
 pub struct FrameMailbox {
     state: Mutex<State>,
@@ -20,6 +30,7 @@ struct State {
     frame: Option<VideoFrame>,
     waker: Option<FrameWaker>,
     notification_pending: bool,
+    state_changed: bool,
 }
 
 impl FrameMailbox {
@@ -39,12 +50,24 @@ impl FrameMailbox {
         }
     }
 
-    /// Takes the newest frame and permits the producer to schedule the next
-    /// wake. The lock makes this transition race-free with `publish`.
-    pub fn take_latest(&self) -> Option<VideoFrame> {
+    /// Atomically takes the newest frame and its state-change marker.
+    ///
+    /// This permits the producer to schedule the next wake. Keeping both
+    /// values under the same lock ensures a state-only wake cannot be lost
+    /// between a frame read and a snapshot refresh decision.
+    pub fn take_update(&self) -> FrameUpdate {
         let mut state = self.state.lock().unwrap();
         state.notification_pending = false;
-        state.frame.take()
+        FrameUpdate {
+            frame: state.frame.take(),
+            state_changed: std::mem::take(&mut state.state_changed),
+        }
+    }
+
+    /// Takes the newest frame, leaving the worker with a bounded one-frame
+    /// slot. Callers that also need state freshness should use [`take_update`].
+    pub fn take_latest(&self) -> Option<VideoFrame> {
+        self.take_update().frame
     }
 
     /// Drops an unread frame, such as when changing streams or seeking.
@@ -76,6 +99,7 @@ impl FrameMailbox {
     pub fn wake(&self) {
         let wake = {
             let mut state = self.state.lock().unwrap();
+            state.state_changed = true;
             Self::schedule_locked(&mut state)
         };
         if let Some(wake) = wake {
@@ -137,5 +161,20 @@ mod tests {
         }));
 
         assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reports_state_changes_with_the_frame_atomically() {
+        let mailbox = FrameMailbox::default();
+        mailbox.publish(frame(1.0));
+        mailbox.wake();
+
+        let update = mailbox.take_update();
+        assert_eq!(update.frame.unwrap().timestamp(), 1.0);
+        assert!(update.state_changed);
+
+        let next = mailbox.take_update();
+        assert!(next.frame.is_none());
+        assert!(!next.state_changed);
     }
 }

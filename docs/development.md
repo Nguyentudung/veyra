@@ -16,7 +16,7 @@ pidstat -u -r -p "$(pgrep -n veyra)" 1 30
 
 ## Conventions
 
-Keep UI state and intent in `src/ui/`, playlist state in `src/playlist/`, the playback façade in `src/playback/`, and native media ownership in `src/video/`. Do not pass native decoder/device pointers or worker-owned Rune objects across the boundary. Keep blocking decode/audio work on the named worker. When a feature or dependency changes, update the relevant section here or in the focused document and add verification evidence.
+Keep UI state and intent in `src/ui/src/`, playlist state in `src/playlist/src/`, the playback façade in `src/playback/src/`, and native media ownership in `src/video/src/`. Each first-party crate lives under `src/<crate>/`; benchmark/test-data tooling intentionally lives outside the application tree in `benchmarks/`. Do not pass native decoder/device pointers or worker-owned Rune objects across the boundary. Keep blocking decode/audio work on the named worker. When a feature or dependency changes, update the relevant section here or in the focused document and add verification evidence.
 
 ## Testing
 

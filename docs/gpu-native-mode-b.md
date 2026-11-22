@@ -30,7 +30,7 @@ context arrives; it does not queue decoded frames.
 
 ## Lifetime and back-pressure
 
-`video/src/rendering/gpu_native.rs` owns four BGRA output textures. A texture
+`src/video/src/rendering/gpu_native.rs` owns four BGRA output textures. A texture
 slot is leased into `rune::native_surface::GpuFrame` when it is published.
 Rune keeps its imported frame in the normal prepared draw and moves it into its
 submission-completion callback. Dropping that last frame drops Veyra's lease,

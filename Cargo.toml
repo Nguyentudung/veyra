@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "app", "cache", "playback", "playlist", "scripting",
-    "statistics", "ui", "utils", "video",
+    "src/app", "src/cache", "src/playback", "src/playlist", "src/scripting",
+    "src/statistics", "src/ui", "src/utils", "src/video",
 ]
 exclude = ["third_party/rune", "third_party/rune/**"]
 resolver = "2"
@@ -14,7 +14,7 @@ license = "Apache-2.0"
 description = "A focused native desktop media player built with Rust and Rune"
 
 [dependencies]
-veyra-app = { path = "app" }
+veyra-app = { path = "src/app" }
 
 [dev-dependencies]
 

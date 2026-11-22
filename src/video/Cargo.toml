@@ -11,7 +11,7 @@ pollster = "1.0.2"
 wgpu = { version = "30.0.2", default-features = false, features = ["vulkan", "glsl", "wgsl"] }
 # Only GPU-native modes use these re-exported wgpu types; readback deliberately
 # keeps its independent Vulkan device for compatibility.
-rune = { path = "../third_party/rune/crates/rune", default-features = false }
+rune = { path = "../../third_party/rune/crates/rune", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72.1"

@@ -5,40 +5,47 @@ Status labels: **Implemented**, **Partially Implemented**, **Planned**, and **Ne
 ## Structure
 
 ```text
-src/
-├── main.rs
-├── app/mod.rs
-├── ui/{mod.rs,styles.rs,lucide.rs}
-├── playback/mod.rs
-├── playlist/mod.rs
-├── utils/mod.rs
-└── video/
-    ├── mod.rs
-    ├── commands.rs
-    ├── state.rs
-    ├── worker.rs
-    ├── ffi.rs
-    ├── decoder/{mod.rs,demuxer.rs,codec.rs,seek.rs}
-    ├── rendering/{mod.rs,decoder.rs,frame.rs,renderer.rs}
-    └── audio/{mod.rs,decoder.rs,resampler.rs,output.rs}
-
-├── build.rs
-└── wrapper.h
+.
+├── Cargo.toml
+├── src/                         # shipped application source
+│   ├── main.rs
+│   ├── app/{Cargo.toml,src/}
+│   ├── cache/{Cargo.toml,src/}
+│   ├── playback/{Cargo.toml,src/}
+│   ├── playlist/{Cargo.toml,src/}
+│   ├── scripting/{Cargo.toml,src/}
+│   ├── statistics/{Cargo.toml,src/}
+│   ├── ui/{Cargo.toml,src/}
+│   ├── utils/{Cargo.toml,src/}
+│   ├── video/
+│   │   ├── Cargo.toml
+│   │   ├── build.rs
+│   │   ├── wrapper.h
+│   │   └── src/{audio,decoder,rendering,...}
+│   └── player/                  # bundled Lua command examples
+├── benchmarks/                  # test-data collection, not part of the app
+│   ├── benchmark.py
+│   └── render_chart.py
+├── assets/
+├── docs/
+├── third_party/
+└── video_test/
 ```
 
-`main.rs` only starts `app::run`. `app/mod.rs` is the application bootstrap. `ui/mod.rs` owns the video-first state-driven view, Rune Kit composition, floating overlays, input handlers, chooser integration, and the playback-to-surface handoff. `ui/lucide.rs` contains the embedded icon set and `ui/styles.rs` contains shared glass styling. `playback/mod.rs` exposes the playback façade; the `video/` tree owns native media and device implementation details. `playlist/mod.rs` owns track data and selection.
+`src/main.rs` only starts `veyra_app::run`. `src/app/src/lib.rs` is the application bootstrap. `src/ui/src/lib.rs` owns the video-first state-driven view, Rune Kit composition, floating overlays, input handlers, chooser integration, and the playback-to-surface handoff. `src/ui/src/lucide.rs` contains the embedded icon set and `src/ui/src/theme.rs` contains shared glass styling. `src/playback/src/lib.rs` exposes the playback façade; `src/video/src/` owns native media and device implementation details. `src/playlist/src/lib.rs` owns track data and selection. `benchmarks/` stays outside this tree because it only collects test data.
 
 ## Engine boundaries
 
-- `video/commands.rs`: worker command protocol.
-- `video/state.rs`: public playback snapshot.
-- `video/worker.rs`: command consumption, decoder replacement, pause loop, and shutdown.
-- `video/decoder/demuxer.rs`: libavformat container and packet ownership.
-- `video/decoder/codec.rs`: stream selection and AVCodecContext lifecycle.
-- `video/decoder/seek.rs`: seek and codec flush operations.
-- `video/audio/`: audio decode, resampling, volume scaling, and ALSA output.
-- `video/rendering/`: software video decode, BGRA frame data, and libswscale conversion.
-- `video/ffi.rs`: generated native bindings boundary.
+- `src/video/src/commands.rs`: worker command protocol.
+- `src/video/src/state.rs`: public playback snapshot.
+- `src/video/src/worker.rs`: command consumption, decoder replacement, pause loop, and shutdown.
+- `src/video/src/mailbox.rs`: one-frame, latest-wins frame handoff and coalesced UI wakeups.
+- `src/video/src/decoder/demuxer.rs`: libavformat container and packet ownership.
+- `src/video/src/decoder/codec.rs`: stream selection and AVCodecContext lifecycle.
+- `src/video/src/decoder/seek.rs`: seek and codec flush operations.
+- `src/video/src/audio/`: audio decode, resampling, volume scaling, and ALSA output.
+- `src/video/src/rendering/`: YUV GPU upload, direct compositor frames, software fallback, and timestamp pacing.
+- `src/video/src/ffi.rs`: generated native bindings boundary.
 
 ```mermaid
 flowchart LR
@@ -48,14 +55,14 @@ flowchart LR
   D --> VC[video codec]
   AC --> R[resampler]
   R --> A[ALSA output]
-  VC --> S[software renderer]
-  S --> F[BGRA VideoFrame]
+  VC --> S[YUV GPU renderer]
+  S --> F[GpuVideoFrame / BGRA fallback]
   F --> NS[Rune NativeSurface]
   NS --> UI
 ```
 
 ## Ownership and concurrency
 
-`Engine` in `playback/mod.rs` owns a command sender, mutex-protected snapshot/frame handles, and one named `veyra-media-engine` thread. The worker in `video/worker.rs` owns `Decoder`; dropping/replacing it releases FFmpeg, swscale, swresample, and ALSA resources. Rune never receives native decoder or device pointers. The frame handle and `NativeSurface` are both latest-wins slots: publishing a new frame replaces an older unpresented frame. `PresentationClock` in `video/rendering/decoder.rs` applies decoded PTS values in stream time-base seconds before a frame is published, so packet decode speed does not determine playback speed.
+`Engine` in `src/playback/src/lib.rs` owns a command sender, mutex-protected snapshot handle, `FrameMailbox`, and one named `veyra-media-engine` thread. The worker in `src/video/src/worker.rs` owns `Decoder`; dropping/replacing it releases FFmpeg, swscale, swresample, and ALSA resources. Rune never receives native decoder or device pointers. The mailbox and `NativeSurface` are both latest-wins slots: publishing a new frame replaces an older unpresented frame. `PresentationClock` in `src/video/src/rendering/decoder.rs` applies decoded PTS values in stream time-base seconds before a frame is published, so packet decode speed does not determine playback speed.
 
 The architecture is intentionally simple, but timing synchronization, bounded queues, and a formal playback state machine remain incomplete.
