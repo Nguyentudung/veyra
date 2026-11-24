@@ -30,6 +30,10 @@ playback does not fail solely because of a threading preference.
 - The software fallback no longer zero-fills an output frame just before
   libswscale overwrites it. It exposes that allocation only after FFmpeg has
   produced all visible rows.
+- The direct NV12 path keeps three leased texture pairs rather than four. It
+  still bounds producer/mailbox/GPU-sampler ownership, saves one full NV12
+  picture (about 3.1 MiB at 1080×1920), and safely drops the newest frame if a
+  severely stalled compositor exhausts the bounded pool.
 - Lua script directory scanning and runtime creation are deferred until a
   stream has its first frame (or one second for audio-only media). Explicit
   reload/console use starts it immediately.
@@ -38,28 +42,40 @@ playback does not fail solely because of a threading preference.
 
 ## FPS telemetry semantics
 
-The benchmark's two FPS values are intentionally source-specific; neither is a
-universal physical-display presentation counter.
+The benchmark keeps media progress separate from delivery and display timing.
+None of these values alone is a universal physical-display presentation counter.
 
-- **Veyra delivery FPS** (`playback_metrics.playback_fps`) is calculated from
-  the delta of Veyra's `rendered_frames` output counter across the measurement
-  window. It represents frames delivered to `NativeSurface` per second. It does
-  not establish that the compositor or monitor scan-out presented every frame.
-- **mpv display-bound FPS** is a display-sync estimate, calculated as
-  `min(estimated-display-fps, estimated-display-fps / vsync-ratio)` only while
-  mpv reports `display-sync-active`. The cap prevents a scheduler cadence above
-  the measured physical refresh from being described as more presentations;
-  the uncapped cadence remains available as `display_sync_scheduled_fps`. With
-  Xvfb, no vsync, or an output backend without display sync, the benchmark
-  writes no mpv FPS value: the terminal summary and chart show it as
-  `N/A`/absent rather than inventing a comparable number.
-- Drop counters remain available regardless of whether the mpv estimate is
-  available. Veyra's `frame_drop_count` is `processed_frames - delivered_frames`,
-  so it includes intentional latest-wins mailbox coalescing when source FPS
-  exceeds UI/display cadence; it is not a confirmed compositor drop count. mpv
-  records output (`vo_frame_drop_count`) and decoder
-  (`decoder_frame_drop_count`) deltas. They describe different pipelines and
-  should be compared as diagnostics, not summed into one cross-player count.
+- **CFR media-clock FPS estimate** (`media_clock_fps_estimate`) is emitted for
+  both Veyra and mpv as nominal ffprobe source FPS × `Δmedia_time / Δwall_time`.
+  It is available in headless runs and is the common FPS panel/chart metric.
+  It is intentionally absent for VFR or unknown-rate media rather than being
+  fabricated from an unreliable nominal FPS.
+- **Veyra delivery FPS** (`delivery_fps`) is the delta of its
+  `rendered_frames` output counter across the measurement window. It represents
+  frames handed to `NativeSurface` per second, not confirmed compositor scanout.
+- **mpv display-sync telemetry** has no presentation-FPS label. When active,
+  `display_sync_scheduled_cadence_fps = estimated_display_fps / vsync_ratio`
+  is a scheduler/source cadence that may exceed physical refresh because drops
+  can contribute zero vsync. Under Xvfb/no vblank it is absent with
+  `no_display_sync`. The benchmark instead still reports its CFR media-clock
+  rate and the explicitly modelled `source_frame_admission_fps_estimate`.
+- Drop counters remain available regardless of display sync. Veyra's
+  `frame_drop_count` is `processed_frames - delivered_frames`, so it includes
+  intentional latest-wins mailbox coalescing. mpv records separate output
+  (`vo_frame_drop_count`) and decoder (`decoder_frame_drop_count`) deltas.
+  Treat them as diagnostics, not one interchangeable total.
+
+## RAM telemetry and headless runs
+
+PSS is the primary cross-process footprint metric; RSS is supplementary. The
+benchmark also records `Pss_Shmem` so GPU-driver/memfd texture allocations are
+visible separately from anonymous application heap.
+
+`make benchmark-headless` is marked `headless_diagnostic`. Xvfb/Mesa can run
+Veyra through Vulkan/lavapipe shared memory while mpv falls back to an X11 VO;
+that makes absolute RAM samples useful for diagnosis but not an honest Veyra vs
+mpv RAM ranking. Use `make benchmark` in a normal desktop session with matched
+backend/VO/AO policy for an end-to-end footprint comparison.
 
 `--mpv-video-sync` selects the mpv `--video-sync` policy; its default is
 `display-resample`, which asks mpv for display-synchronised telemetry when the
@@ -71,9 +87,9 @@ python3 -B benchmarks/benchmark.py --runs 5 \
   --mpv-video-sync=display-resample
 ```
 
-Use a normal, vsync-capable graphical session when comparing display-bound FPS.
-Xvfb/Mesa is still suitable for repeatable startup, CPU, RAM, Veyra delivery
-FPS, and drop-counter runs, but mpv display-bound FPS must be treated as `N/A`.
+Use a normal, vsync-capable graphical session when comparing display timing.
+Xvfb/Mesa remains suitable for controlled smoke diagnostics and common CFR
+media-clock FPS, but not for cross-player renderer RAM or physical-display FPS.
 
 ## Repeatable benchmark workflow
 
@@ -100,17 +116,17 @@ for example:
 make benchmark-headless
 ```
 
-`benchmark-headless` clears inherited Wayland socket variables and forces
-Rune/winit to X11 before starting Xvfb. Do not simply wrap `make benchmark` in
-`xvfb-run` from a Wayland shell: winit can otherwise select the parent Wayland
-session instead of the Xvfb display.
+`benchmark-headless` clears inherited Wayland socket variables, forces
+Rune/winit to X11, and records `--headless` before starting Xvfb. Do not simply
+wrap `make benchmark` in `xvfb-run` from a Wayland shell: winit can otherwise
+select the parent Wayland session instead of the Xvfb display.
 
-The JSON artifact records startup, process CPU, RSS/PSS, Veyra delivery
-telemetry (including rendered/processed frames, output-delta FPS, interval and
-jitter, conversion timings, drop counters, and effective decoder threads), and
-mpv display-sync telemetry when it is available (display-bound FPS estimate and
-its output/decoder drop counters). Under Xvfb or no vsync, the mpv display-bound
-FPS is intentionally absent/`N/A`.
+The JSON artifact records startup, process CPU, RSS/PSS/PSS-shared, Veyra
+delivery telemetry (including rendered/processed frames, output-delta FPS,
+interval and jitter, conversion timings, drop counters, and effective decoder
+threads), and mpv media-clock, drop, VO/AO, and display-sync diagnostics. Under
+Xvfb/no vsync the display-sync cadence is absent, while CFR media-clock FPS is
+still reported for both players.
 Performance runs are intentionally informational rather than a hard CI gate:
 GPU drivers, CPU frequency policy, and desktop compositors make small
 cross-machine deltas unreliable. Compare several runs on the same idle host

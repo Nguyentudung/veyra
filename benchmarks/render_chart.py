@@ -79,28 +79,35 @@ BAR_METRICS = (
     ),
     BarMetric(
         "C",
-        "Bộ nhớ RSS",
-        "RSS trung vị của từng lượt trong khi phát",
-        "RSS trung vị mỗi lượt (MiB)",
-        lambda run: float(run["metrics"]["memory_kib"]["rss_kib"]["median"]) / 1024.0,
-    ),
-    BarMetric(
-        "D",
-        "Bộ nhớ PSS",
-        "PSS trung vị của từng lượt trong khi phát",
+        "Bộ nhớ PSS (chính)",
+        "PSS trung vị của từng lượt trong khi phát; đây là footprint chính để so sánh tiến trình",
         "PSS trung vị mỗi lượt (MiB)",
         lambda run: float(run["metrics"]["memory_kib"]["pss_kib"]["median"]) / 1024.0,
     ),
     BarMetric(
+        "D",
+        "PSS bộ nhớ chia sẻ / GPU",
+        "Pss_Shmem trung vị; giúp nhận diện memfd/driver/texture không phải heap ứng dụng",
+        "PSS shared trung vị mỗi lượt (MiB)",
+        lambda run: float(run["metrics"]["memory_kib"]["pss_shmem_kib"]["median"]) / 1024.0,
+        allow_missing=True,
+    ),
+    BarMetric(
         "E",
-        "FPS phát video",
+        "Bộ nhớ RSS (phụ)",
+        "RSS trung vị của từng lượt trong khi phát; bao gồm trang dùng chung đầy đủ",
+        "RSS trung vị mỗi lượt (MiB)",
+        lambda run: float(run["metrics"]["memory_kib"]["rss_kib"]["median"]) / 1024.0,
+    ),
+    BarMetric(
+        "F",
+        "FPS theo media clock (CFR)",
         (
-            "Veyra: khung video được giao cho NativeSurface / giây; mpv: ước lượng "
-            "display-sync, giới hạn không quá refresh (min(refresh, refresh / vsync ratio)). "
-            "mpv N/A khi display-sync không khả dụng."
+            "FPS danh nghĩa của fixture CFR nhân với tốc độ tiến media / thời gian thực. "
+            "Có thể đo dưới Xvfb nhưng không phải số khung physically presented."
         ),
-        "FPS (khung/giây)",
-        lambda run: float(run["playback_metrics"]["playback_fps"]),
+        "FPS ước lượng theo media clock",
+        lambda run: float(run["playback_metrics"]["media_clock_fps_estimate"]),
         higher_is_better=True,
         allow_missing=True,
     ),
@@ -132,15 +139,22 @@ TIME_METRICS = (
         lambda value: value / 1024.0,
     ),
     TimeMetric(
-        "Diễn biến FPS phát video",
+        "Diễn biến PSS bộ nhớ chia sẻ / GPU",
+        "Pss_Shmem lấy mẫu trong khi phát; làm rõ chi phí memfd/driver/texture",
+        "PSS shared (MiB)",
+        "memory_samples_kib",
+        "pss_shmem_kib",
+        lambda value: value / 1024.0,
+    ),
+    TimeMetric(
+        "Diễn biến FPS theo media clock (CFR)",
         (
-            "Veyra: delta khung được giao / giây; mpv: display-sync estimate giới hạn "
-            "theo refresh. "
-            "Đường mpv vắng mặt khi hệ thống không có display-sync."
+            "FPS danh nghĩa của fixture CFR nhân với tiến độ media / thời gian thực. "
+            "Có cả khi mpv không có display-sync, nhưng không phải số khung đã present."
         ),
-        "FPS (khung/giây)",
+        "FPS ước lượng theo media clock",
         "playback_samples",
-        "playback_fps",
+        "media_clock_fps_estimate",
         lambda value: value,
     ),
 )
@@ -191,6 +205,12 @@ def style_axis(axis: Any) -> None:
 def protocol_text(document: dict[str, Any]) -> str:
     configuration = document.get("configuration", {})
     media = Path(document.get("media", {}).get("path", "unknown media")).name
+    execution_mode = configuration.get("execution_mode", "desktop_end_to_end")
+    scope = (
+        "HEADLESS diagnostic: không xếp hạng RAM/FPS trình bày giữa hai player."
+        if execution_mode == "headless_diagnostic"
+        else "Desktop end-to-end: vẫn cần cùng backend/VO/AO để so sánh nghiêm ngặt."
+    )
     return (
         f"Video: {media}  |  Lượt chạy: Veyra n={len(document['runs']['veyra'])}, "
         f"mpv n={len(document['runs']['mpv'])}  |  "
@@ -200,7 +220,8 @@ def protocol_text(document: dict[str, Any]) -> str:
         f"Trình dựng Veyra: {configuration.get('veyra_renderer', 'không rõ')}  |  "
         f"Backend cửa sổ Veyra: {configuration.get('veyra_window_backend', 'auto')}  |  "
         f"Giải mã phần cứng mpv: {configuration.get('mpv_hwdec', 'không rõ')}  |  "
-        f"Đồng bộ video mpv: {configuration.get('mpv_video_sync', 'không rõ')}"
+        f"Đồng bộ video mpv: {configuration.get('mpv_video_sync', 'không rõ')}\n"
+        f"Chế độ: {execution_mode}. {scope}"
     )
 
 
@@ -301,10 +322,11 @@ def render_bar_summary(document: dict[str, Any], output: Path) -> None:
         draw_bar_metric(figure.add_subplot(grid[index * 2 + 1]), document, metric)
     figure.text(
         0.07,
-        0.025,
+        0.020,
         f"Nguồn log: {document.get('generated_at_utc', 'không rõ')}  |  "
-        "Mỗi cột là trung vị của các lượt chạy hoàn tất. CPU có thể vượt 100% khi dùng nhiều hơn một lõi.  |  "
-        "PSS phân bổ trang nhớ dùng chung và phù hợp để so sánh giữa các tiến trình.",
+        "Mỗi cột = trung vị; CPU có thể >100% khi dùng nhiều hơn một lõi.\n"
+        "PSS phân bổ trang dùng chung; PSS shared phơi bày memfd/driver/texture. "
+        "Media-clock FPS không phải số khung đã physically presented.",
         color=MUTED,
         fontsize=8.5,
     )

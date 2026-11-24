@@ -10,8 +10,10 @@ build time in the reported startup time.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -34,6 +36,24 @@ PROC_STAT_CLOCK_TICKS = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
 class BenchmarkError(RuntimeError):
     """A benchmark could not reach a comparable, measurable playback state."""
+
+
+@dataclass(frozen=True)
+class MediaInfo:
+    """Facts needed to keep media-clock estimates honest.
+
+    A timeline expressed as frames/second is meaningful only for a controlled
+    constant-frame-rate fixture.  For variable-rate content we retain duration
+    but deliberately leave ``source_video_fps`` unset.
+    """
+
+    duration_seconds: float | None
+    source_video_fps: float | None
+    frame_rate_mode: str
+
+
+PlaybackValue = float | int | bool | str
+PlaybackSample = dict[str, PlaybackValue]
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +149,14 @@ def parse_args() -> argparse.Namespace:
         help="write the JSON log only",
     )
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "mark this as a headless diagnostic run; renderer-backed RAM and physical-display "
+            "ranking are reported as non-comparable"
+        ),
+    )
+    parser.add_argument(
         "--build-veyra",
         action="store_true",
         help="build the release binary before benchmarking (excluded from measurements)",
@@ -175,19 +203,34 @@ def require_chart_renderer() -> None:
         )
 
 
-def media_duration_seconds(media: Path) -> float | None:
+def parse_frame_rate(value: object) -> float | None:
+    """Parse ffprobe's ``numerator/denominator`` rate without accepting NaN."""
+    if not isinstance(value, str) or "/" not in value:
+        return None
+    numerator, denominator = value.split("/", maxsplit=1)
+    try:
+        rate = int(numerator) / int(denominator)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return rate if math.isfinite(rate) and rate > 0 else None
+
+
+def inspect_media(media: Path) -> MediaInfo:
+    """Read duration plus a conservative CFR source-rate declaration once."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
-        return None
+        return MediaInfo(None, None, "unavailable")
     completed = subprocess.run(
         [
             ffprobe,
             "-v",
             "error",
+            "-select_streams",
+            "v:0",
             "-show_entries",
-            "format=duration",
+            "format=duration:stream=avg_frame_rate,r_frame_rate",
             "-of",
-            "default=noprint_wrappers=1:nokey=1",
+            "json",
             str(media),
         ],
         check=False,
@@ -195,11 +238,29 @@ def media_duration_seconds(media: Path) -> float | None:
         text=True,
     )
     if completed.returncode != 0:
-        return None
+        return MediaInfo(None, None, "unavailable")
     try:
-        return float(completed.stdout.strip())
-    except ValueError:
-        return None
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return MediaInfo(None, None, "unavailable")
+    duration: float | None = None
+    raw_duration = document.get("format", {}).get("duration")
+    try:
+        candidate = float(raw_duration)
+        if math.isfinite(candidate) and candidate >= 0:
+            duration = candidate
+    except (TypeError, ValueError):
+        pass
+    stream = next(iter(document.get("streams", ())), {})
+    average_rate = parse_frame_rate(stream.get("avg_frame_rate"))
+    real_rate = parse_frame_rate(stream.get("r_frame_rate"))
+    if (
+        average_rate is not None
+        and real_rate is not None
+        and math.isclose(average_rate, real_rate, rel_tol=1e-9, abs_tol=1e-9)
+    ):
+        return MediaInfo(duration, average_rate, "cfr")
+    return MediaInfo(duration, None, "variable_or_unknown")
 
 
 def read_proc_ticks(pid: int) -> int:
@@ -226,6 +287,10 @@ def read_memory_kib(pid: int) -> dict[str, int]:
         "Pss:": "pss_kib",
         "Pss_Anon:": "pss_anon_kib",
         "Pss_File:": "pss_file_kib",
+        # GPU drivers often back textures and staging resources with memfd or
+        # other shared mappings. Keeping this component visible prevents a
+        # renderer/backend difference from being misdiagnosed as Rust heap use.
+        "Pss_Shmem:": "pss_shmem_kib",
         "Private_Dirty:": "private_dirty_kib",
     }
     result: dict[str, int] = {}
@@ -257,7 +322,7 @@ def collect_metrics(
     sample_seconds: float,
     interval: float,
     label: str,
-    playback_sampler: Callable[[], dict[str, float | int | bool] | None] | None = None,
+    playback_sampler: Callable[[], PlaybackSample | None] | None = None,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     started_ticks = read_proc_ticks(process.pid)
@@ -265,7 +330,7 @@ def collect_metrics(
     previous_at = started_at
     deadline = started_at + sample_seconds
     samples: list[dict[str, float | int]] = []
-    playback_samples: list[dict[str, float | int | bool]] = []
+    playback_samples: list[PlaybackSample] = []
     while True:
         if process.poll() is not None:
             raise BenchmarkError(f"{label} exited during CPU/RAM sampling")
@@ -310,7 +375,14 @@ def collect_metrics(
 
 def summarize_memory(samples: list[dict[str, float | int]]) -> dict[str, dict[str, int]]:
     result: dict[str, dict[str, int]] = {}
-    for key in ("rss_kib", "pss_kib", "pss_anon_kib", "pss_file_kib", "private_dirty_kib"):
+    for key in (
+        "rss_kib",
+        "pss_kib",
+        "pss_anon_kib",
+        "pss_file_kib",
+        "pss_shmem_kib",
+        "private_dirty_kib",
+    ):
         values = [int(sample[key]) for sample in samples if key in sample]
         if values:
             result[key] = {
@@ -323,6 +395,7 @@ def summarize_memory(samples: list[dict[str, float | int]]) -> dict[str, dict[st
 VEYRA_TELEMETRY_FIELDS = (
     "video_frames_processed",
     "rendered_frames",
+    "playback_position_seconds",
     "render_fps",
     "frame_interval_ms",
     "frame_jitter_ms",
@@ -347,7 +420,7 @@ def read_veyra_playback_metrics(path: Path) -> dict[str, float | int]:
         raise BenchmarkError("Veyra did not write playback telemetry") from error
     except json.JSONDecodeError as error:
         raise BenchmarkError(f"Veyra playback telemetry is invalid JSON: {error}") from error
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if not isinstance(document, dict) or document.get("schema_version") not in (1, 2):
         raise BenchmarkError("Veyra playback telemetry has an unsupported schema")
     metrics: dict[str, float | int] = {}
     for field in VEYRA_TELEMETRY_FIELDS:
@@ -374,7 +447,10 @@ def try_read_veyra_playback_metrics(path: Path) -> dict[str, float | int] | None
 
 
 MPV_PLAYBACK_PROPERTIES = (
+    "current-vo",
+    "current-ao",
     "display-sync-active",
+    "display-fps",
     "estimated-display-fps",
     "vsync-ratio",
     "estimated-vf-fps",
@@ -439,12 +515,20 @@ def mpv_get_properties(socket_path: Path, properties: tuple[str, ...]) -> dict[s
     return matched
 
 
-def read_mpv_playback_metrics(socket_path: Path) -> dict[str, float | int | bool]:
-    """Read mpv display-sync estimates and cumulative frame-health counters."""
+def finite_number(value: object) -> float | int | None:
+    """Return a numeric IPC value only if it is finite and non-boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def read_mpv_playback_metrics(socket_path: Path) -> dict[str, float | int | bool | str]:
+    """Read mpv clocks, display diagnostics, and cumulative frame counters."""
     values = mpv_get_properties(socket_path, MPV_PLAYBACK_PROPERTIES)
-    metrics: dict[str, float | int | bool] = {}
+    metrics: dict[str, float | int | bool | str] = {}
     boolean_fields = {"display-sync-active": "display_sync_active"}
     numeric_fields = {
+        "display-fps": "display_refresh_fps",
         "estimated-display-fps": "estimated_display_fps",
         "vsync-ratio": "vsync_ratio",
         "estimated-vf-fps": "estimated_vf_fps",
@@ -455,15 +539,21 @@ def read_mpv_playback_metrics(socket_path: Path) -> dict[str, float | int | bool
         "vo-delayed-frame-count": "vo_delayed_frame_count",
         "vo-presentation-delay": "vo_presentation_delay_seconds",
     }
+    string_fields = {
+        "current-vo": "current_vo",
+        "current-ao": "current_ao",
+    }
     for property_name, metric_name in boolean_fields.items():
         value = values.get(property_name)
         if isinstance(value, bool):
             metrics[metric_name] = value
     for property_name, metric_name in numeric_fields.items():
+        if (value := finite_number(values.get(property_name))) is not None:
+            metrics[metric_name] = value
+    for property_name, metric_name in string_fields.items():
         value = values.get(property_name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        metrics[metric_name] = value
+        if isinstance(value, str) and value:
+            metrics[metric_name] = value
 
     missing = {"vo_frame_drop_count", "decoder_frame_drop_count"}.difference(metrics)
     if missing:
@@ -471,8 +561,14 @@ def read_mpv_playback_metrics(socket_path: Path) -> dict[str, float | int | bool
     return metrics
 
 
-def mpv_scheduled_video_fps(sample: dict[str, float | int | bool]) -> float | None:
-    """Return mpv's display-sync scheduled video cadence before a refresh cap."""
+def mpv_display_sync_scheduled_cadence_fps(
+    sample: dict[str, float | int | bool | str],
+) -> float | None:
+    """Return mpv's schedule cadence, never a claimed presentation rate.
+
+    ``vsync-ratio`` includes zero-vsync dropped frames, so a cadence can exceed
+    physical refresh.  Retain it as a diagnostic only; it is not a display FPS.
+    """
     if sample.get("display_sync_active") is not True:
         return None
     display_fps = sample.get("estimated_display_fps")
@@ -489,65 +585,106 @@ def mpv_scheduled_video_fps(sample: dict[str, float | int | bool]) -> float | No
     return float(display_fps) / float(vsync_ratio)
 
 
-def mpv_playback_fps(sample: dict[str, float | int | bool]) -> float | None:
-    """Conservatively estimate presentations/s from mpv display-sync telemetry.
-
-    mpv's ``vsync-ratio`` can be below one when its video filter/scheduler
-    cadence exceeds display refresh. A display cannot present more than one
-    distinct flip per refresh, so cap that scheduled cadence at measured refresh
-    instead of reporting an impossible physical presentation rate.
-    """
-    scheduled_fps = mpv_scheduled_video_fps(sample)
-    display_fps = sample.get("estimated_display_fps")
-    if (
-        scheduled_fps is None
-        or isinstance(display_fps, bool)
-        or not isinstance(display_fps, (int, float))
-    ):
-        return None
-    return min(scheduled_fps, float(display_fps))
-
-
 def append_final_playback_sample(
-    metrics: dict[str, Any], playback_sample: dict[str, float | int | bool]
+    metrics: dict[str, Any], playback_sample: PlaybackSample
 ) -> None:
-    """Ensure cumulative counters include a snapshot at the measurement end."""
-    metrics["playback_samples"].append(
-        {"elapsed_seconds": metrics["duration_seconds"], **playback_sample}
-    )
+    """Append an end snapshot without creating a near-zero timeline interval."""
+    final_sample = {
+        "elapsed_seconds": metrics["duration_seconds"],
+        **playback_sample,
+        "snapshot_only": True,
+    }
+    # Keep the last periodic sample as well: a very short measurement window
+    # may otherwise have only one sample and be unable to form a counter delta.
+    # Timeline annotations deliberately skip this snapshot-only point.
+    metrics["playback_samples"].append(final_sample)
 
 
 def counter_delta(
-    samples: list[dict[str, float | int | bool]], field: str
+    samples: list[PlaybackSample], field: str
 ) -> tuple[float, float]:
     """Return a monotonic counter delta and its elapsed measurement time."""
     usable = [
         sample
         for sample in samples
-        if isinstance(sample.get(field), (int, float))
-        and not isinstance(sample.get(field), bool)
-        and isinstance(sample.get("elapsed_seconds"), (int, float))
+        if finite_number(sample.get(field)) is not None
+        and finite_number(sample.get("elapsed_seconds")) is not None
     ]
     if len(usable) < 2:
         raise BenchmarkError(f"not enough {field} samples to calculate playback FPS")
     first, last = usable[0], usable[-1]
-    elapsed = float(last["elapsed_seconds"]) - float(first["elapsed_seconds"])
-    delta = float(last[field]) - float(first[field])
+    elapsed = float(finite_number(last["elapsed_seconds"])) - float(
+        finite_number(first["elapsed_seconds"])
+    )
+    delta = float(finite_number(last[field])) - float(finite_number(first[field]))
     if elapsed <= 0 or delta < 0:
         raise BenchmarkError(f"invalid {field} counter progression during playback sampling")
     return delta, elapsed
 
 
-def annotate_veyra_playback_samples(
-    samples: list[dict[str, float | int | bool]],
+def annotate_media_clock_samples(
+    samples: list[PlaybackSample],
+    position_field: str,
+    source_video_fps: float | None,
 ) -> None:
-    previous: dict[str, float | int | bool] | None = None
+    """Add a CFR timeline-rate estimate without calling it presentation FPS."""
+    if source_video_fps is None:
+        return
+    previous: PlaybackSample | None = None
     for sample in samples:
+        if sample.get("snapshot_only") is True:
+            previous = sample
+            continue
+        if previous is not None:
+            elapsed_value = finite_number(sample.get("elapsed_seconds"))
+            previous_elapsed_value = finite_number(previous.get("elapsed_seconds"))
+            position = finite_number(sample.get(position_field))
+            previous_position = finite_number(previous.get(position_field))
+            if (
+                elapsed_value is not None
+                and previous_elapsed_value is not None
+                and position is not None
+                and previous_position is not None
+            ):
+                elapsed = float(elapsed_value) - float(previous_elapsed_value)
+                media_delta = float(position) - float(previous_position)
+                if elapsed > 0 and media_delta >= 0:
+                    speed = media_delta / elapsed
+                    sample["media_clock_speed"] = round(speed, 4)
+                    sample["media_clock_fps_estimate"] = round(source_video_fps * speed, 2)
+        previous = sample
+
+
+def summarize_media_clock(
+    samples: list[PlaybackSample], position_field: str, source_video_fps: float | None
+) -> dict[str, float]:
+    """Use full-window media-time progress so 250 ms sampling jitter cancels out."""
+    if source_video_fps is None:
+        return {}
+    try:
+        media_delta, elapsed = counter_delta(samples, position_field)
+    except BenchmarkError:
+        return {}
+    speed = media_delta / elapsed
+    return {
+        "media_clock_speed": round(speed, 4),
+        "media_clock_fps_estimate": round(source_video_fps * speed, 2),
+    }
+
+
+def annotate_veyra_playback_samples(
+    samples: list[PlaybackSample], source_video_fps: float | None = None
+) -> None:
+    previous: PlaybackSample | None = None
+    for sample in samples:
+        if sample.get("snapshot_only") is True:
+            previous = sample
+            continue
         if previous is not None:
             elapsed = float(sample["elapsed_seconds"]) - float(previous["elapsed_seconds"])
             if elapsed > 0:
                 for source, target in (
-                    ("rendered_frames", "playback_fps"),
+                    ("rendered_frames", "delivery_fps"),
                     ("video_frames_processed", "processed_fps"),
                     ("dropped_frames", "frame_drop_fps"),
                 ):
@@ -555,24 +692,26 @@ def annotate_veyra_playback_samples(
                     if delta >= 0:
                         sample[target] = round(delta / elapsed, 2)
         previous = sample
+    annotate_media_clock_samples(samples, "playback_position_seconds", source_video_fps)
 
 
 def summarize_veyra_playback(
-    samples: list[dict[str, float | int | bool]],
+    samples: list[PlaybackSample], source_video_fps: float | None = None
 ) -> dict[str, Any]:
     rendered_delta, elapsed = counter_delta(samples, "rendered_frames")
     processed_delta, _ = counter_delta(samples, "video_frames_processed")
     dropped_delta, _ = counter_delta(samples, "dropped_frames")
     final = samples[-1]
     result: dict[str, Any] = {
-        "fps_measurement": "delivered_video_frames",
+        "delivery_fps_measurement": "native_surface_handoff",
         "measurement_window_seconds": round(elapsed, 3),
-        "playback_fps": round(rendered_delta / elapsed, 2),
+        "delivery_fps": round(rendered_delta / elapsed, 2),
         "processed_fps": round(processed_delta / elapsed, 2),
         "frame_drop_count": round(dropped_delta),
         "frame_drop_fps": round(dropped_delta / elapsed, 2),
         "frame_drop_semantics": "processed_minus_delivered_estimate",
     }
+    result.update(summarize_media_clock(samples, "playback_position_seconds", source_video_fps))
     for source, target in (
         ("render_fps", "render_fps_rolling"),
         ("frame_interval_ms", "frame_interval_ms"),
@@ -587,27 +726,39 @@ def summarize_veyra_playback(
     return result
 
 
-def annotate_mpv_playback_samples(samples: list[dict[str, float | int | bool]]) -> None:
+def annotate_mpv_playback_samples(
+    samples: list[PlaybackSample], source_video_fps: float | None = None
+) -> None:
     for sample in samples:
-        scheduled_fps = mpv_scheduled_video_fps(sample)
+        if sample.get("snapshot_only") is True:
+            continue
+        scheduled_fps = mpv_display_sync_scheduled_cadence_fps(sample)
         if scheduled_fps is not None:
-            sample["display_sync_scheduled_fps"] = round(scheduled_fps, 2)
-        fps = mpv_playback_fps(sample)
-        if fps is not None:
-            sample["playback_fps"] = round(fps, 2)
+            sample["display_sync_scheduled_cadence_fps"] = round(scheduled_fps, 2)
+    annotate_media_clock_samples(samples, "playback_time_seconds", source_video_fps)
 
 
 def summarize_mpv_playback(
-    samples: list[dict[str, float | int | bool]],
+    samples: list[PlaybackSample], source_video_fps: float | None = None
 ) -> dict[str, Any]:
     vo_drops, elapsed = counter_delta(samples, "vo_frame_drop_count")
     decoder_drops, _ = counter_delta(samples, "decoder_frame_drop_count")
     result: dict[str, Any] = {
-        "fps_measurement": "display_sync_refresh_capped_estimate",
         "measurement_window_seconds": round(elapsed, 3),
         "vo_frame_drop_count": round(vo_drops),
         "decoder_frame_drop_count": round(decoder_drops),
+        "vo_frame_drop_fps": round(vo_drops / elapsed, 2),
+        "decoder_frame_drop_fps": round(decoder_drops / elapsed, 2),
     }
+    media_clock = summarize_media_clock(samples, "playback_time_seconds", source_video_fps)
+    result.update(media_clock)
+    if (media_clock_fps := media_clock.get("media_clock_fps_estimate")) is not None:
+        result["source_frame_admission_fps_estimate"] = round(
+            max(0.0, media_clock_fps - (vo_drops + decoder_drops) / elapsed), 2
+        )
+        result["source_frame_admission_semantics"] = (
+            "cfr_media_clock_minus_vo_and_decoder_drops"
+        )
     for source, target in (
         ("mistimed_frame_count", "mistimed_frame_count"),
         ("vo_delayed_frame_count", "vo_delayed_frame_count"),
@@ -617,31 +768,29 @@ def summarize_mpv_playback(
         except BenchmarkError:
             continue
         result[target] = round(delta)
-    fps_values = [
-        float(sample["playback_fps"])
-        for sample in samples
-        if isinstance(sample.get("playback_fps"), (int, float))
-        and not isinstance(sample.get("playback_fps"), bool)
-    ]
-    if fps_values:
-        result["playback_fps"] = round(statistics.median(fps_values), 2)
     scheduled_fps_values = [
-        float(sample["display_sync_scheduled_fps"])
+        float(sample["display_sync_scheduled_cadence_fps"])
         for sample in samples
-        if isinstance(sample.get("display_sync_scheduled_fps"), (int, float))
-        and not isinstance(sample.get("display_sync_scheduled_fps"), bool)
+        if finite_number(sample.get("display_sync_scheduled_cadence_fps")) is not None
     ]
     if scheduled_fps_values:
-        result["display_sync_scheduled_fps"] = round(statistics.median(scheduled_fps_values), 2)
+        result["display_sync_scheduled_cadence_fps"] = round(
+            statistics.median(scheduled_fps_values), 2
+        )
     final = samples[-1]
     for source, target in (
-        ("estimated_vf_fps", "estimated_vf_fps"),
+        ("display_refresh_fps", "display_refresh_estimate_fps"),
         ("estimated_display_fps", "estimated_display_fps"),
         ("vsync_ratio", "vsync_ratio"),
         ("vo_presentation_delay_seconds", "vo_presentation_delay_seconds"),
     ):
         if source in final:
             result[target] = final[source]
+    for source, target in (("current_vo", "current_vo"), ("current_ao", "current_ao")):
+        if isinstance(final.get(source), str):
+            result[target] = final[source]
+    if final.get("display_sync_active") is not True:
+        result["display_sync_unavailable_reason"] = "no_display_sync"
     return result
 
 
@@ -744,8 +893,10 @@ def run_veyra(
         append_final_playback_sample(
             metrics, read_veyra_playback_metrics(playback_metrics_path)
         )
-        annotate_veyra_playback_samples(metrics["playback_samples"])
-        playback_metrics = summarize_veyra_playback(metrics["playback_samples"])
+        annotate_veyra_playback_samples(metrics["playback_samples"], args.source_video_fps)
+        playback_metrics = summarize_veyra_playback(
+            metrics["playback_samples"], args.source_video_fps
+        )
     finally:
         stop_process(process)
     return {
@@ -788,7 +939,7 @@ def run_mpv(
             started_at,
         )
         wait_while_running(process, args.warmup_seconds, "mpv")
-        def sample_mpv_playback() -> dict[str, float | int | bool] | None:
+        def sample_mpv_playback() -> PlaybackSample | None:
             try:
                 return read_mpv_playback_metrics(socket_path)
             except (ConnectionError, FileNotFoundError, OSError, json.JSONDecodeError):
@@ -802,8 +953,10 @@ def run_mpv(
             sample_mpv_playback,
         )
         append_final_playback_sample(metrics, read_mpv_playback_metrics(socket_path))
-        annotate_mpv_playback_samples(metrics["playback_samples"])
-        playback_metrics = summarize_mpv_playback(metrics["playback_samples"])
+        annotate_mpv_playback_samples(metrics["playback_samples"], args.source_video_fps)
+        playback_metrics = summarize_mpv_playback(
+            metrics["playback_samples"], args.source_video_fps
+        )
     finally:
         stop_process(process)
         socket_path.unlink(missing_ok=True)
@@ -848,7 +1001,14 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "cpu_percent": distribution([run["metrics"]["cpu_percent"] for run in runs]),
         "memory_kib": {},
     }
-    for key in ("rss_kib", "pss_kib", "pss_anon_kib", "pss_file_kib", "private_dirty_kib"):
+    for key in (
+        "rss_kib",
+        "pss_kib",
+        "pss_anon_kib",
+        "pss_file_kib",
+        "pss_shmem_kib",
+        "private_dirty_kib",
+    ):
         values = [run["metrics"]["memory_kib"].get(key) for run in runs]
         medians = [value["median"] for value in values if value is not None]
         maxima = [value["max"] for value in values if value is not None]
@@ -868,44 +1028,68 @@ def format_mib(kib: float) -> str:
     return f"{kib / 1024.0:.1f} MiB"
 
 
-def print_summary(summaries: dict[str, dict[str, Any]]) -> None:
+def print_summary(summaries: dict[str, dict[str, Any]], *, headless: bool) -> None:
+    def memory_value(memory: dict[str, Any], name: str) -> str:
+        metric = memory.get(name)
+        if metric is None:
+            return "N/A"
+        return f"{format_mib(metric['median_of_run_medians'])} / {format_mib(metric['max_of_runs'])}"
+
+    def median(playback: dict[str, Any], name: str) -> str:
+        metric = playback.get(name)
+        return "N/A" if metric is None else f"{metric['median']:.2f}"
+
     print()
-    print("player  startup (median)  CPU (median)  RSS (median / max)  PSS (median / max)")
+    print("player  PSS primary (median / max)  PSS shared (median / max)  RSS (median / max)")
+    for player in ("veyra", "mpv"):
+        memory = summaries[player]["memory_kib"]
+        print(
+            f"{player:<6}  {memory_value(memory, 'pss_kib'):<27}  "
+            f"{memory_value(memory, 'pss_shmem_kib'):<26}  "
+            f"{memory_value(memory, 'rss_kib')}"
+        )
+    print("PSS is the primary cross-process footprint; RSS is supplemental.")
+    print()
+    print("player  startup (median)  CPU (median)")
     for player in ("veyra", "mpv"):
         summary = summaries[player]
-        memory = summary["memory_kib"]
-        rss = memory["rss_kib"]
-        pss = memory["pss_kib"]
         print(
-            f"{player:<6}  "
-            f"{summary['startup_ms']['median']:>8.2f} ms      "
-            f"{summary['cpu_percent']['median']:>6.2f}%      "
-            f"{format_mib(rss['median_of_run_medians'])} / {format_mib(rss['max_of_runs'])}  "
-            f"{format_mib(pss['median_of_run_medians'])} / {format_mib(pss['max_of_runs'])}"
+            f"{player:<6}  {summary['startup_ms']['median']:>8.2f} ms      "
+            f"{summary['cpu_percent']['median']:>6.2f}%"
         )
     print()
-    print("player  playback FPS (median)  undelivered / drops (median)  FPS measurement")
+    print("player  CFR media-clock FPS  handoff / admission estimate       drop counters")
     for player in ("veyra", "mpv"):
         playback = summaries[player].get("playback_metrics", {})
-
-        def median(name: str, suffix: str = "") -> str:
-            metric = playback.get(name)
-            return "N/A" if metric is None else f"{metric['median']:.2f}{suffix}"
-
         if player == "veyra":
-            drops = f"not delivered {median('frame_drop_count')}"
-            source = "delivered video frames / second"
+            pipeline_rate = f"NativeSurface handoff {median(playback, 'delivery_fps')}"
+            drops = f"undelivered {median(playback, 'frame_drop_count')}"
         else:
+            pipeline_rate = f"source admission est. {median(playback, 'source_frame_admission_fps_estimate')}"
             drops = (
-                f"VO {median('vo_frame_drop_count')}, "
-                f"decoder {median('decoder_frame_drop_count')}"
+                f"VO {median(playback, 'vo_frame_drop_count')}, "
+                f"decoder {median(playback, 'decoder_frame_drop_count')}"
             )
-            source = "display-sync estimate (capped at refresh)"
-        print(f"{player:<6}  {median('playback_fps'):>19}  {drops:<27}  {source}")
+        print(
+            f"{player:<6}  {median(playback, 'media_clock_fps_estimate'):>19}  "
+            f"{pipeline_rate:<34}  {drops}"
+        )
+    mpv_playback = summaries["mpv"].get("playback_metrics", {})
+    scheduled = median(mpv_playback, "display_sync_scheduled_cadence_fps")
+    refresh = median(mpv_playback, "display_refresh_estimate_fps")
     print(
-        "FPS is player-side telemetry, not a confirmed compositor-present counter; "
-        "mpv reports N/A when display-sync is unavailable."
+        "CFR media-clock FPS = nominal source FPS × media-time progress / wall time; "
+        "it is not a physical presentation counter."
     )
+    print(
+        "mpv display diagnostics: refresh estimate "
+        f"{refresh}, scheduled cadence {scheduled} (diagnostic only; never presentation FPS)."
+    )
+    if headless:
+        print(
+            "HEADLESS DIAGNOSTIC: do not rank player RAM or physical-display FPS here; "
+            "Xvfb/Mesa can select different renderer backends and driver allocations."
+        )
 
 
 def write_json(path: Path, document: dict[str, Any]) -> None:
@@ -928,7 +1112,9 @@ def main() -> int:
         subprocess.run(["cargo", "build", "--release"], cwd=REPOSITORY_ROOT, check=True)
     args.veyra_bin = resolve_executable(args.veyra_bin, "Veyra")
     args.mpv_bin = resolve_executable(args.mpv_bin, "mpv")
-    duration = media_duration_seconds(args.media)
+    media_info = inspect_media(args.media)
+    args.source_video_fps = media_info.source_video_fps
+    duration = media_info.duration_seconds
     playback_window = args.warmup_seconds + args.sample_seconds
     if duration is not None and playback_window >= duration:
         raise BenchmarkError(
@@ -961,7 +1147,7 @@ def main() -> int:
 
     summaries = {player: summarize_runs(runs) for player, runs in run_results.items()}
     document = {
-        "schema_version": 4,
+        "schema_version": 5,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "environment": {
             "platform": sys.platform,
@@ -973,6 +1159,8 @@ def main() -> int:
         "media": {
             "path": str(args.media),
             "duration_seconds": duration,
+            "source_video_fps": media_info.source_video_fps,
+            "frame_rate_mode": media_info.frame_rate_mode,
         },
         "configuration": {
             "runs": args.runs,
@@ -985,6 +1173,11 @@ def main() -> int:
             "veyra_thread_mode": args.veyra_thread_mode,
             "mpv_hwdec": args.mpv_hwdec,
             "mpv_video_sync": args.mpv_video_sync,
+            "execution_mode": "headless_diagnostic" if args.headless else "desktop_end_to_end",
+        },
+        "comparison_scope": {
+            "ram_ranking": "diagnostic_only" if args.headless else "end_to_end_footprint",
+            "display_presentation_fps": "unavailable_in_headless" if args.headless else "backend_dependent",
         },
         "chart": None if args.no_chart else str(args.chart_output),
         "timeline_chart": None if args.no_chart else str(args.timeline_output),
@@ -1006,7 +1199,7 @@ def main() -> int:
             ],
             check=True,
         )
-    print_summary(summaries)
+    print_summary(summaries, headless=args.headless)
     print(f"\nJSON: {args.output}")
     if not args.no_chart:
         print(f"Bar charts: {args.chart_output}")

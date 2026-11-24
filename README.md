@@ -41,15 +41,17 @@ Run the workspace with `cargo run` and test all crates with `cargo test --worksp
 The test-data harness is documented in [benchmarks/README.md](benchmarks/README.md).
 It is deliberately outside `src/`, because it is not part of the shipped
 application. It uses Python plus `matplotlib` to write a JSON log and PNG chart
-under the repository-root `log/` directory, including player-side FPS and
-frame-drop telemetry. To build Veyra if needed and run on the active desktop:
+under the repository-root `log/` directory, including CFR media-clock FPS,
+delivery/drop telemetry, and PSS shared-memory diagnostics. To build Veyra if
+needed and run on the active desktop:
 
 ```sh
 make benchmark
 ```
 
 For headless Xvfb automation, use `make benchmark-headless` instead; it forces
-the X11 backend rather than inheriting a Wayland socket.
+the X11 backend rather than inheriting a Wayland socket and labels the result as
+diagnostic-only for cross-player renderer RAM and physical-display FPS.
 
 ## Architecture and research
 

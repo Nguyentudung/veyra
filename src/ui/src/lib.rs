@@ -259,7 +259,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             &snapshot,
             state.playlist.current_track().map(|t| t.path.as_path()),
         );
-        write_benchmark_metrics(&state.statistics);
+        write_benchmark_metrics(&state.statistics, snapshot.position);
         state.next_statistics_sample = now + STATISTICS_SAMPLE_INTERVAL;
     }
     if stream_changed {
@@ -389,7 +389,7 @@ fn mark_benchmark_ready() {
 /// Writes opt-in playback telemetry for the external benchmark harness. This
 /// path is never touched during ordinary playback, and it is sampled at the
 /// same 250 ms cadence as the statistics panel rather than per rendered frame.
-fn write_benchmark_metrics(statistics: &StatisticsSnapshot) {
+fn write_benchmark_metrics(statistics: &StatisticsSnapshot, playback_position_seconds: f64) {
     let Some(path) = std::env::var_os("VEYRA_BENCHMARK_METRICS_FILE") else {
         return;
     };
@@ -402,9 +402,10 @@ fn write_benchmark_metrics(statistics: &StatisticsSnapshot) {
     };
     let document = format!(
         concat!(
-            "{{\"schema_version\":1,",
+            "{{\"schema_version\":2,",
             "\"video_frames_processed\":{},",
             "\"rendered_frames\":{},",
+            "\"playback_position_seconds\":{},",
             "\"render_fps\":{},",
             "\"frame_interval_ms\":{},",
             "\"frame_jitter_ms\":{},",
@@ -417,6 +418,7 @@ fn write_benchmark_metrics(statistics: &StatisticsSnapshot) {
         ),
         statistics.video_frames_processed,
         statistics.rendered_frames,
+        number(Some(playback_position_seconds)),
         number(statistics.render_fps),
         number(statistics.frame_interval_ms),
         number(statistics.frame_jitter_ms),

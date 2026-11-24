@@ -16,7 +16,12 @@ use std::{
     time::Instant,
 };
 
-const VIDEO_SLOT_COUNT: usize = 4;
+// The latest-wins handoff needs one texture being uploaded, one in the
+// mailbox, and one still sampled by Rune. A fourth slot only masks a stalled
+// compositor while retaining another full NV12 picture for the whole session.
+// Keep the steady-state pool at three so the normal GPU path does not reserve
+// an extra 1.5 bytes/pixel of video memory.
+const VIDEO_SLOT_COUNT: usize = 3;
 
 struct PlaneSlot {
     _y: wgpu::Texture,

@@ -5,11 +5,11 @@ Veyra and mpv. It measures:
 
 - startup: process launch until the first video output is ready;
 - CPU: total process CPU time over the sampling window, from `/proc/<pid>/stat`;
-- RAM: RSS, PSS, anonymous PSS, file PSS, and private dirty memory from
+- RAM: RSS, PSS, anonymous/file/shared PSS, and private dirty memory from
   `/proc/<pid>/smaps_rollup`.
-- playback telemetry and FPS: Veyra delivery FPS from output-frame deltas;
-  mpv's refresh-capped display-sync estimate when it is available; and
-  player-specific frame-drop counters.
+- playback telemetry and FPS: a shared CFR media-clock FPS estimate for both
+  players (including Xvfb), Veyra delivery FPS, mpv admission/drop diagnostics,
+  and optional display-sync scheduling diagnostics.
 
 It needs Linux, Python 3.10 or newer, `mpv`, `matplotlib`, and an already-built
 Veyra release binary. Install the chart dependency once:
@@ -42,7 +42,7 @@ outside the build directory in the repository-root `log/` folder:
 - `log/veyra-vs-mpv.json` — structured benchmark data log;
 - `log/veyra-vs-mpv.png` — bar-chart summary generated from that JSON log;
 - `log/veyra-vs-mpv-timeline.png` — line charts showing sampled CPU, RSS, PSS,
-  and available playback FPS over time;
+  shared PSS, and CFR media-clock FPS over time;
 - `log/logs/` — the captured stdout/stderr for each player run.
 
 The white-background bar-chart summary has one panel per criterion. Each panel
@@ -52,18 +52,19 @@ statistic, unit, and preferred direction stated directly on the chart.
 - **A. Startup latency** — process launch to first video output; unit: ms.
 - **B. CPU utilisation** — total CPU time of all player threads during the
   sampling window; unit: % of one CPU core.
-- **C. RSS memory** — per-run median resident set size during playback; unit:
-  MiB.
-- **D. PSS memory** — per-run median proportional set size during playback;
-  unit: MiB. PSS apportions shared pages and is the more useful comparison
-  measure.
-- **E. Playback FPS** — Veyra's delivered-video rate and, when display sync is
-  active, mpv's refresh-capped display-sync estimate; unit: frames/s. Higher is better,
-  but see the measurement definitions below before treating the values as a
-  like-for-like compositor-present count.
+- **C. PSS memory (primary)** — per-run median proportional set size during
+  playback; unit: MiB. PSS apportions shared pages and is the primary footprint
+  comparison measure.
+- **D. Shared PSS / GPU memory** — per-run `Pss_Shmem`; unit: MiB. This exposes
+  memfd, driver, and texture allocations that are not Rust heap allocations.
+- **E. RSS memory (supplementary)** — per-run median resident set size; unit:
+  MiB. It includes shared pages in full and should not decide a close comparison.
+- **F. CFR media-clock FPS** — nominal fixture FPS multiplied by media-time
+  progress over wall time; unit: frames/s. It works without display sync, but is
+  not a compositor-present count.
 
 The separate timeline PNG has line charts for interval CPU utilisation, RSS,
-PSS, and playback FPS. Each line is the median at a sampling position across
+PSS, shared PSS, and CFR media-clock FPS. Each line is the median at a sampling position across
 completed runs; its shaded band spans the minimum to maximum. Startup is a
 one-time measurement, so it is included only in the bar-chart summary. The
 benchmark records interval CPU, memory, and playback samples at
@@ -71,21 +72,27 @@ benchmark records interval CPU, memory, and playback samples at
 
 ### FPS and drop-counter semantics
 
-The FPS panel compares useful player telemetry, not a confirmed physical-display
-scan-out counter:
+The FPS panel compares controlled-fixture progress, not a confirmed
+physical-display scan-out counter:
 
+- **CFR media-clock FPS estimate** is calculated for both players as nominal
+  ffprobe source FPS × `Δmedia_time / Δwall_time`. It is emitted only when
+  `avg_frame_rate == r_frame_rate`; VFR/unknown fixtures report it as **N/A**.
+  It remains available under Xvfb, which fixes the old mpv `N/A` gap without
+  claiming that a frame was physically presented.
 - **Veyra delivery FPS** is the delta of its `rendered_frames` output counter
   divided by elapsed sampling time. It means video frames delivered to Veyra's
   `NativeSurface` per second. It is not proof that a compositor or monitor
   presented every one of those frames.
-- **mpv display-bound FPS** is an estimate calculated from active display-sync
-  telemetry as `min(estimated-display-fps, estimated-display-fps / vsync-ratio)`.
-  The cap avoids claiming more physical presentations than the measured display
-  refresh; the uncapped scheduler cadence is retained as
-  `display_sync_scheduled_fps`. It is reported only while mpv says display sync
-  is active. With Xvfb, a headless/no-vsync backend, or another output without
-  active display sync, mpv FPS is deliberately **N/A**; the FPS bar and
-  timeline line can therefore be absent.
+- **mpv display-sync telemetry** is deliberately diagnostic only. When active,
+  `display_sync_scheduled_cadence_fps = estimated_display_fps / vsync_ratio` is
+  retained as a scheduler/source cadence. It can exceed physical refresh and is
+  never labelled presentation FPS. Under Xvfb/no vblank it is absent with the
+  explicit `no_display_sync` reason; the shared CFR media-clock estimate still
+  remains available.
+- **mpv source-frame admission estimate** subtracts VO and decoder drop rates
+  from the CFR media-clock rate. It is a modelled pipeline-health value, not a
+  successful-display-flip counter.
 - Veyra also records the sampled-window `frame_drop_count` (and rate), but it
   is the estimate `processed_frames - delivered_frames`. It includes deliberate
   latest-wins mailbox coalescing when source FPS exceeds the UI/display rate,
@@ -103,10 +110,11 @@ python3 -B benchmarks/benchmark.py --runs 5 \
   --mpv-video-sync=display-resample
 ```
 
-For a display-bound FPS comparison, run both players on the same normal
-vsync-capable graphical display. A headless Xvfb run remains useful for startup,
-CPU, memory, Veyra delivery FPS, and drop counters, but it is not an mpv
-display-bound-FPS comparison.
+For display timing diagnostics, run both players on the same normal
+vsync-capable graphical display. A headless Xvfb run remains useful for a
+repeatable smoke/instrumentation pass, but it is not a cross-player renderer-RAM
+or physical-display-FPS ranking: Xvfb/Mesa can select radically different VO,
+GPU-driver, and shared-memory paths.
 
 To render a chart again from a saved log without re-running playback:
 
@@ -145,9 +153,9 @@ python3 -B benchmarks/benchmark.py \
 
 Run it on an otherwise idle desktop, use the same display/backend for both
 players, and compare summary medians as well as the time-series shape rather
-than a single run. A graphical session is required for an mpv display-bound-FPS
-comparison. In headless automation, provide Xvfb/Mesa yourself, for example
-`make benchmark-headless`; expect mpv display-bound FPS to be `N/A` there. That
-target clears inherited Wayland socket variables and forces Rune/winit to X11;
-wrapping `make benchmark` in `xvfb-run` alone can still select a parent Wayland
-session instead of Xvfb.
+than a single run. A graphical session is required for physical-display timing.
+In headless automation, use `make benchmark-headless`; its `--headless` marker
+prints an explicit warning and records that RAM/display ranking is diagnostic
+only. That target clears inherited Wayland socket variables and forces
+Rune/winit to X11; wrapping `make benchmark` in `xvfb-run` alone can still
+select a parent Wayland session instead of Xvfb.
