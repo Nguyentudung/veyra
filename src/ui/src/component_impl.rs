@@ -100,7 +100,7 @@ pub(crate) fn options_view(state: &State, kit: &Kit) -> El {
             open_media(s);
         }))
         .child(menu_item(kit, "Reload tools", "R", |s| {
-            s.scripts.reload();
+            s.reload_scripts();
             s.status = "Tools reloaded".into();
         }))
         .child(menu_item(kit, "Lua console", "", |s| {
@@ -308,6 +308,18 @@ fn page(state: &State, kit: &Kit) -> El {
             .child(row_value(kit, "Decoder", optional(s.video_decoder.clone())))
             .child(row_value(
                 kit,
+                "Decode threads",
+                s.video_decode_threads
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Thread mode",
+                optional(s.video_decode_thread_type.clone()),
+            ))
+            .child(row_value(
+                kit,
                 "Frames processed",
                 s.video_frames_processed.to_string(),
             ))
@@ -446,6 +458,15 @@ fn page(state: &State, kit: &Kit) -> El {
                 s.dropped_frames
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "—".into()),
+            ))
+            .child(row_value(
+                kit,
+                "Decode threads",
+                match (&s.video_decode_threads, &s.video_decode_thread_type) {
+                    (Some(count), Some(mode)) => format!("{count} ({mode})"),
+                    (Some(count), None) => count.to_string(),
+                    _ => "—".into(),
+                },
             ))
             .child(row_value(kit, "Sampling", "250 ms")),
         4 => col()

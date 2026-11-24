@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repeatable CPU, memory and startup benchmarks for Veyra and mpv.
+"""Repeatable playback-FPS, CPU, memory and startup benchmarks for Veyra and mpv.
 
 Measurement collection uses Python's standard library; PNG chart rendering uses
 matplotlib. The tool is Linux-specific: CPU and memory come from /proc, and mpv
@@ -38,7 +38,10 @@ class BenchmarkError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Measure Veyra and mpv startup time, CPU and RAM on one media file."
+        description=(
+            "Measure Veyra and mpv startup, playback FPS, frame drops, CPU and RAM "
+            "on one media file."
+        )
     )
     parser.add_argument("--media", type=Path, default=DEFAULT_MEDIA, help="media fixture to play")
     parser.add_argument(
@@ -80,9 +83,28 @@ def parse_args() -> argparse.Namespace:
         help="Veyra renderer passed through VEYRA_VIDEO_RENDERER",
     )
     parser.add_argument(
+        "--veyra-threads",
+        default="auto",
+        help="VEYRA_VIDEO_THREADS value (auto, 1, or a positive thread count)",
+    )
+    parser.add_argument(
+        "--veyra-thread-mode",
+        default="auto",
+        choices=("auto", "frame", "slice"),
+        help="VEYRA_VIDEO_THREAD_MODE value",
+    )
+    parser.add_argument(
         "--mpv-hwdec",
         default="no",
         help="mpv --hwdec value; default no matches Veyra's software decode path",
+    )
+    parser.add_argument(
+        "--mpv-video-sync",
+        default="display-resample",
+        help=(
+            "mpv --video-sync value; display-resample enables mpv's display-synchronised "
+            "FPS estimate when the video output supports it"
+        ),
     )
     parser.add_argument(
         "--mpv-arg",
@@ -231,7 +253,11 @@ def wait_while_running(process: subprocess.Popen[bytes], seconds: float, label: 
 
 
 def collect_metrics(
-    process: subprocess.Popen[bytes], sample_seconds: float, interval: float, label: str
+    process: subprocess.Popen[bytes],
+    sample_seconds: float,
+    interval: float,
+    label: str,
+    playback_sampler: Callable[[], dict[str, float | int | bool] | None] | None = None,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     started_ticks = read_proc_ticks(process.pid)
@@ -239,13 +265,15 @@ def collect_metrics(
     previous_at = started_at
     deadline = started_at + sample_seconds
     samples: list[dict[str, float | int]] = []
+    playback_samples: list[dict[str, float | int | bool]] = []
     while True:
         if process.poll() is not None:
             raise BenchmarkError(f"{label} exited during CPU/RAM sampling")
         sampled_at = time.perf_counter()
         sampled_ticks = read_proc_ticks(process.pid)
         sample = read_memory_kib(process.pid)
-        sample["elapsed_seconds"] = round(sampled_at - started_at, 3)
+        elapsed_seconds = round(sampled_at - started_at, 3)
+        sample["elapsed_seconds"] = elapsed_seconds
         interval_seconds = sampled_at - previous_at
         if interval_seconds > 0.001:
             sample["cpu_percent"] = round(
@@ -255,6 +283,12 @@ def collect_metrics(
                 2,
             )
         samples.append(sample)
+        if playback_sampler is not None:
+            playback_sample = playback_sampler()
+            if playback_sample is not None:
+                playback_samples.append(
+                    {"elapsed_seconds": elapsed_seconds, **playback_sample}
+                )
         previous_at = sampled_at
         previous_ticks = sampled_ticks
         remaining = deadline - time.perf_counter()
@@ -270,6 +304,7 @@ def collect_metrics(
         "cpu_percent": round(cpu_percent, 2),
         "memory_kib": summarize_memory(samples),
         "memory_samples_kib": samples,
+        "playback_samples": playback_samples,
     }
 
 
@@ -282,6 +317,331 @@ def summarize_memory(samples: list[dict[str, float | int]]) -> dict[str, dict[st
                 "median": round(statistics.median(values)),
                 "max": max(values),
             }
+    return result
+
+
+VEYRA_TELEMETRY_FIELDS = (
+    "video_frames_processed",
+    "rendered_frames",
+    "render_fps",
+    "frame_interval_ms",
+    "frame_jitter_ms",
+    "frame_processing_ms",
+    "frame_processing_avg_ms",
+    "frame_processing_peak_ms",
+    "dropped_frames",
+    "decode_threads",
+)
+
+
+def read_veyra_playback_metrics(path: Path) -> dict[str, float | int]:
+    """Read the atomically-updated Veyra telemetry sidecar.
+
+    The player writes this only when VEYRA_BENCHMARK_METRICS_FILE is set, so a
+    missing or malformed file indicates the compared binary is too old or the
+    benchmark session did not reach its sampling path.
+    """
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise BenchmarkError("Veyra did not write playback telemetry") from error
+    except json.JSONDecodeError as error:
+        raise BenchmarkError(f"Veyra playback telemetry is invalid JSON: {error}") from error
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise BenchmarkError("Veyra playback telemetry has an unsupported schema")
+    metrics: dict[str, float | int] = {}
+    for field in VEYRA_TELEMETRY_FIELDS:
+        value = document.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise BenchmarkError(f"Veyra playback telemetry {field} is not numeric")
+        metrics[field] = value
+    required = {"video_frames_processed", "rendered_frames", "dropped_frames"}
+    missing = required.difference(metrics)
+    if missing:
+        raise BenchmarkError(
+            "Veyra playback telemetry is missing " + ", ".join(sorted(missing))
+        )
+    return metrics
+
+
+def try_read_veyra_playback_metrics(path: Path) -> dict[str, float | int] | None:
+    """Return no sample until Veyra has published its first atomic sidecar."""
+    if not path.exists():
+        return None
+    return read_veyra_playback_metrics(path)
+
+
+MPV_PLAYBACK_PROPERTIES = (
+    "display-sync-active",
+    "estimated-display-fps",
+    "vsync-ratio",
+    "estimated-vf-fps",
+    "playback-time",
+    "frame-drop-count",
+    "decoder-frame-drop-count",
+    "mistimed-frame-count",
+    "vo-delayed-frame-count",
+    "vo-presentation-delay",
+)
+
+
+def parse_mpv_ipc_responses(
+    payload: bytes, requested_properties: dict[int, str]
+) -> dict[str, Any]:
+    """Extract matching IPC replies while ignoring asynchronous mpv events."""
+    result: dict[str, Any] = {}
+    for line in payload.splitlines():
+        response = json.loads(line)
+        request_id = response.get("request_id")
+        property_name = requested_properties.get(request_id)
+        if property_name is None:
+            continue
+        result[property_name] = (
+            response.get("data") if response.get("error") == "success" else None
+        )
+    return result
+
+
+def mpv_get_properties(socket_path: Path, properties: tuple[str, ...]) -> dict[str, Any]:
+    """Read several mpv IPC properties, matching responses by request ID."""
+    if not socket_path.exists():
+        raise FileNotFoundError(socket_path)
+    requested_properties = {
+        8100 + index: property_name for index, property_name in enumerate(properties)
+    }
+    request = b"".join(
+        (
+            json.dumps(
+                {"command": ["get_property", property_name], "request_id": request_id}
+            ).encode("utf-8")
+            + b"\n"
+        )
+        for request_id, property_name in requested_properties.items()
+    )
+    received = b""
+    matched: dict[str, Any] = {}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(0.25)
+        connection.connect(str(socket_path))
+        connection.sendall(request)
+        while len(matched) < len(requested_properties):
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            received += chunk
+            complete, separator, remainder = received.rpartition(b"\n")
+            if not separator:
+                continue
+            received = remainder
+            matched.update(parse_mpv_ipc_responses(complete, requested_properties))
+    return matched
+
+
+def read_mpv_playback_metrics(socket_path: Path) -> dict[str, float | int | bool]:
+    """Read mpv display-sync estimates and cumulative frame-health counters."""
+    values = mpv_get_properties(socket_path, MPV_PLAYBACK_PROPERTIES)
+    metrics: dict[str, float | int | bool] = {}
+    boolean_fields = {"display-sync-active": "display_sync_active"}
+    numeric_fields = {
+        "estimated-display-fps": "estimated_display_fps",
+        "vsync-ratio": "vsync_ratio",
+        "estimated-vf-fps": "estimated_vf_fps",
+        "playback-time": "playback_time_seconds",
+        "frame-drop-count": "vo_frame_drop_count",
+        "decoder-frame-drop-count": "decoder_frame_drop_count",
+        "mistimed-frame-count": "mistimed_frame_count",
+        "vo-delayed-frame-count": "vo_delayed_frame_count",
+        "vo-presentation-delay": "vo_presentation_delay_seconds",
+    }
+    for property_name, metric_name in boolean_fields.items():
+        value = values.get(property_name)
+        if isinstance(value, bool):
+            metrics[metric_name] = value
+    for property_name, metric_name in numeric_fields.items():
+        value = values.get(property_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        metrics[metric_name] = value
+
+    missing = {"vo_frame_drop_count", "decoder_frame_drop_count"}.difference(metrics)
+    if missing:
+        raise BenchmarkError("mpv IPC is missing " + ", ".join(sorted(missing)))
+    return metrics
+
+
+def mpv_scheduled_video_fps(sample: dict[str, float | int | bool]) -> float | None:
+    """Return mpv's display-sync scheduled video cadence before a refresh cap."""
+    if sample.get("display_sync_active") is not True:
+        return None
+    display_fps = sample.get("estimated_display_fps")
+    vsync_ratio = sample.get("vsync_ratio")
+    if (
+        isinstance(display_fps, bool)
+        or not isinstance(display_fps, (int, float))
+        or isinstance(vsync_ratio, bool)
+        or not isinstance(vsync_ratio, (int, float))
+        or display_fps <= 0
+        or vsync_ratio <= 0
+    ):
+        return None
+    return float(display_fps) / float(vsync_ratio)
+
+
+def mpv_playback_fps(sample: dict[str, float | int | bool]) -> float | None:
+    """Conservatively estimate presentations/s from mpv display-sync telemetry.
+
+    mpv's ``vsync-ratio`` can be below one when its video filter/scheduler
+    cadence exceeds display refresh. A display cannot present more than one
+    distinct flip per refresh, so cap that scheduled cadence at measured refresh
+    instead of reporting an impossible physical presentation rate.
+    """
+    scheduled_fps = mpv_scheduled_video_fps(sample)
+    display_fps = sample.get("estimated_display_fps")
+    if (
+        scheduled_fps is None
+        or isinstance(display_fps, bool)
+        or not isinstance(display_fps, (int, float))
+    ):
+        return None
+    return min(scheduled_fps, float(display_fps))
+
+
+def append_final_playback_sample(
+    metrics: dict[str, Any], playback_sample: dict[str, float | int | bool]
+) -> None:
+    """Ensure cumulative counters include a snapshot at the measurement end."""
+    metrics["playback_samples"].append(
+        {"elapsed_seconds": metrics["duration_seconds"], **playback_sample}
+    )
+
+
+def counter_delta(
+    samples: list[dict[str, float | int | bool]], field: str
+) -> tuple[float, float]:
+    """Return a monotonic counter delta and its elapsed measurement time."""
+    usable = [
+        sample
+        for sample in samples
+        if isinstance(sample.get(field), (int, float))
+        and not isinstance(sample.get(field), bool)
+        and isinstance(sample.get("elapsed_seconds"), (int, float))
+    ]
+    if len(usable) < 2:
+        raise BenchmarkError(f"not enough {field} samples to calculate playback FPS")
+    first, last = usable[0], usable[-1]
+    elapsed = float(last["elapsed_seconds"]) - float(first["elapsed_seconds"])
+    delta = float(last[field]) - float(first[field])
+    if elapsed <= 0 or delta < 0:
+        raise BenchmarkError(f"invalid {field} counter progression during playback sampling")
+    return delta, elapsed
+
+
+def annotate_veyra_playback_samples(
+    samples: list[dict[str, float | int | bool]],
+) -> None:
+    previous: dict[str, float | int | bool] | None = None
+    for sample in samples:
+        if previous is not None:
+            elapsed = float(sample["elapsed_seconds"]) - float(previous["elapsed_seconds"])
+            if elapsed > 0:
+                for source, target in (
+                    ("rendered_frames", "playback_fps"),
+                    ("video_frames_processed", "processed_fps"),
+                    ("dropped_frames", "frame_drop_fps"),
+                ):
+                    delta = float(sample[source]) - float(previous[source])
+                    if delta >= 0:
+                        sample[target] = round(delta / elapsed, 2)
+        previous = sample
+
+
+def summarize_veyra_playback(
+    samples: list[dict[str, float | int | bool]],
+) -> dict[str, Any]:
+    rendered_delta, elapsed = counter_delta(samples, "rendered_frames")
+    processed_delta, _ = counter_delta(samples, "video_frames_processed")
+    dropped_delta, _ = counter_delta(samples, "dropped_frames")
+    final = samples[-1]
+    result: dict[str, Any] = {
+        "fps_measurement": "delivered_video_frames",
+        "measurement_window_seconds": round(elapsed, 3),
+        "playback_fps": round(rendered_delta / elapsed, 2),
+        "processed_fps": round(processed_delta / elapsed, 2),
+        "frame_drop_count": round(dropped_delta),
+        "frame_drop_fps": round(dropped_delta / elapsed, 2),
+        "frame_drop_semantics": "processed_minus_delivered_estimate",
+    }
+    for source, target in (
+        ("render_fps", "render_fps_rolling"),
+        ("frame_interval_ms", "frame_interval_ms"),
+        ("frame_jitter_ms", "frame_jitter_ms"),
+        ("frame_processing_ms", "frame_processing_ms"),
+        ("frame_processing_avg_ms", "frame_processing_avg_ms"),
+        ("frame_processing_peak_ms", "frame_processing_peak_ms"),
+        ("decode_threads", "decode_threads"),
+    ):
+        if source in final:
+            result[target] = final[source]
+    return result
+
+
+def annotate_mpv_playback_samples(samples: list[dict[str, float | int | bool]]) -> None:
+    for sample in samples:
+        scheduled_fps = mpv_scheduled_video_fps(sample)
+        if scheduled_fps is not None:
+            sample["display_sync_scheduled_fps"] = round(scheduled_fps, 2)
+        fps = mpv_playback_fps(sample)
+        if fps is not None:
+            sample["playback_fps"] = round(fps, 2)
+
+
+def summarize_mpv_playback(
+    samples: list[dict[str, float | int | bool]],
+) -> dict[str, Any]:
+    vo_drops, elapsed = counter_delta(samples, "vo_frame_drop_count")
+    decoder_drops, _ = counter_delta(samples, "decoder_frame_drop_count")
+    result: dict[str, Any] = {
+        "fps_measurement": "display_sync_refresh_capped_estimate",
+        "measurement_window_seconds": round(elapsed, 3),
+        "vo_frame_drop_count": round(vo_drops),
+        "decoder_frame_drop_count": round(decoder_drops),
+    }
+    for source, target in (
+        ("mistimed_frame_count", "mistimed_frame_count"),
+        ("vo_delayed_frame_count", "vo_delayed_frame_count"),
+    ):
+        try:
+            delta, _ = counter_delta(samples, source)
+        except BenchmarkError:
+            continue
+        result[target] = round(delta)
+    fps_values = [
+        float(sample["playback_fps"])
+        for sample in samples
+        if isinstance(sample.get("playback_fps"), (int, float))
+        and not isinstance(sample.get("playback_fps"), bool)
+    ]
+    if fps_values:
+        result["playback_fps"] = round(statistics.median(fps_values), 2)
+    scheduled_fps_values = [
+        float(sample["display_sync_scheduled_fps"])
+        for sample in samples
+        if isinstance(sample.get("display_sync_scheduled_fps"), (int, float))
+        and not isinstance(sample.get("display_sync_scheduled_fps"), bool)
+    ]
+    if scheduled_fps_values:
+        result["display_sync_scheduled_fps"] = round(statistics.median(scheduled_fps_values), 2)
+    final = samples[-1]
+    for source, target in (
+        ("estimated_vf_fps", "estimated_vf_fps"),
+        ("estimated_display_fps", "estimated_display_fps"),
+        ("vsync_ratio", "vsync_ratio"),
+        ("vo_presentation_delay_seconds", "vo_presentation_delay_seconds"),
+    ):
+        if source in final:
+            result[target] = final[source]
     return result
 
 
@@ -344,40 +704,25 @@ def wait_for_ready(
 
 
 def mpv_is_ready(socket_path: Path) -> bool:
-    if not socket_path.exists():
-        return False
-    request_id = 731
-    request = json.dumps(
-        {"command": ["get_property", "vo-configured"], "request_id": request_id}
-    ).encode() + b"\n"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(0.15)
-        connection.connect(str(socket_path))
-        connection.sendall(request)
-        received = b""
-        while b"\n" not in received:
-            chunk = connection.recv(4096)
-            if not chunk:
-                return False
-            received += chunk
-        for line in received.splitlines():
-            response = json.loads(line)
-            if response.get("request_id") == request_id:
-                return response.get("error") == "success" and bool(response.get("data"))
-    return False
+    return bool(mpv_get_properties(socket_path, ("vo-configured",)).get("vo-configured"))
 
 
 def run_veyra(
     args: argparse.Namespace, run_number: int, temporary_dir: Path, logs_dir: Path
 ) -> dict[str, Any]:
     ready_path = temporary_dir / f"veyra-ready-{run_number}"
+    playback_metrics_path = temporary_dir / f"veyra-playback-{run_number}.json"
     ready_path.unlink(missing_ok=True)
+    playback_metrics_path.unlink(missing_ok=True)
     environment = os.environ.copy()
     environment.update(
         {
             "VEYRA_OPEN_MEDIA": str(args.media),
             "VEYRA_VIDEO_RENDERER": args.veyra_renderer,
+            "VEYRA_VIDEO_THREADS": args.veyra_threads,
+            "VEYRA_VIDEO_THREAD_MODE": args.veyra_thread_mode,
             "VEYRA_BENCHMARK_READY_FILE": str(ready_path),
+            "VEYRA_BENCHMARK_METRICS_FILE": str(playback_metrics_path),
         }
     )
     command = [str(args.veyra_bin)]
@@ -389,7 +734,18 @@ def run_veyra(
             process, args.ready_timeout, ready_path.exists, "Veyra", started_at
         )
         wait_while_running(process, args.warmup_seconds, "Veyra")
-        metrics = collect_metrics(process, args.sample_seconds, args.sample_interval, "Veyra")
+        metrics = collect_metrics(
+            process,
+            args.sample_seconds,
+            args.sample_interval,
+            "Veyra",
+            lambda: try_read_veyra_playback_metrics(playback_metrics_path),
+        )
+        append_final_playback_sample(
+            metrics, read_veyra_playback_metrics(playback_metrics_path)
+        )
+        annotate_veyra_playback_samples(metrics["playback_samples"])
+        playback_metrics = summarize_veyra_playback(metrics["playback_samples"])
     finally:
         stop_process(process)
     return {
@@ -398,6 +754,7 @@ def run_veyra(
         "command": command,
         "startup_ms": round(startup_ms, 2),
         "metrics": metrics,
+        "playback_metrics": playback_metrics,
         "log": str(log_path),
     }
 
@@ -413,6 +770,8 @@ def run_mpv(
         "--force-window=yes",
         "--keep-open=yes",
         f"--hwdec={args.mpv_hwdec}",
+        f"--video-sync={args.mpv_video_sync}",
+        "--framedrop=vo",
         f"--input-ipc-server={socket_path}",
         *args.mpv_arg,
         str(args.media),
@@ -429,7 +788,22 @@ def run_mpv(
             started_at,
         )
         wait_while_running(process, args.warmup_seconds, "mpv")
-        metrics = collect_metrics(process, args.sample_seconds, args.sample_interval, "mpv")
+        def sample_mpv_playback() -> dict[str, float | int | bool] | None:
+            try:
+                return read_mpv_playback_metrics(socket_path)
+            except (ConnectionError, FileNotFoundError, OSError, json.JSONDecodeError):
+                return None
+
+        metrics = collect_metrics(
+            process,
+            args.sample_seconds,
+            args.sample_interval,
+            "mpv",
+            sample_mpv_playback,
+        )
+        append_final_playback_sample(metrics, read_mpv_playback_metrics(socket_path))
+        annotate_mpv_playback_samples(metrics["playback_samples"])
+        playback_metrics = summarize_mpv_playback(metrics["playback_samples"])
     finally:
         stop_process(process)
         socket_path.unlink(missing_ok=True)
@@ -439,12 +813,33 @@ def run_mpv(
         "command": command,
         "startup_ms": round(startup_ms, 2),
         "metrics": metrics,
+        "playback_metrics": playback_metrics,
         "log": str(log_path),
     }
 
 
 def distribution(values: list[float]) -> dict[str, float]:
     return {"median": round(statistics.median(values), 2), "max": round(max(values), 2)}
+
+
+def summarize_playback_metrics(runs: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    summary: dict[str, dict[str, float]] = {}
+    fields = {
+        field
+        for run in runs
+        for field, value in run.get("playback_metrics", {}).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    for field in sorted(fields):
+        values = [
+            float(run["playback_metrics"][field])
+            for run in runs
+            if isinstance(run.get("playback_metrics", {}).get(field), (int, float))
+            and not isinstance(run.get("playback_metrics", {}).get(field), bool)
+        ]
+        if values:
+            summary[field] = distribution(values)
+    return summary
 
 
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -463,6 +858,9 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "median_of_run_medians": round(statistics.median(medians)),
             "max_of_runs": max(maxima),
         }
+    playback = summarize_playback_metrics(runs)
+    if playback:
+        summary["playback_metrics"] = playback
     return summary
 
 
@@ -485,6 +883,29 @@ def print_summary(summaries: dict[str, dict[str, Any]]) -> None:
             f"{format_mib(rss['median_of_run_medians'])} / {format_mib(rss['max_of_runs'])}  "
             f"{format_mib(pss['median_of_run_medians'])} / {format_mib(pss['max_of_runs'])}"
         )
+    print()
+    print("player  playback FPS (median)  undelivered / drops (median)  FPS measurement")
+    for player in ("veyra", "mpv"):
+        playback = summaries[player].get("playback_metrics", {})
+
+        def median(name: str, suffix: str = "") -> str:
+            metric = playback.get(name)
+            return "N/A" if metric is None else f"{metric['median']:.2f}{suffix}"
+
+        if player == "veyra":
+            drops = f"not delivered {median('frame_drop_count')}"
+            source = "delivered video frames / second"
+        else:
+            drops = (
+                f"VO {median('vo_frame_drop_count')}, "
+                f"decoder {median('decoder_frame_drop_count')}"
+            )
+            source = "display-sync estimate (capped at refresh)"
+        print(f"{player:<6}  {median('playback_fps'):>19}  {drops:<27}  {source}")
+    print(
+        "FPS is player-side telemetry, not a confirmed compositor-present counter; "
+        "mpv reports N/A when display-sync is unavailable."
+    )
 
 
 def write_json(path: Path, document: dict[str, Any]) -> None:
@@ -540,7 +961,7 @@ def main() -> int:
 
     summaries = {player: summarize_runs(runs) for player, runs in run_results.items()}
     document = {
-        "schema_version": 2,
+        "schema_version": 4,
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "environment": {
             "platform": sys.platform,
@@ -559,7 +980,11 @@ def main() -> int:
             "sample_seconds": args.sample_seconds,
             "sample_interval_seconds": args.sample_interval,
             "veyra_renderer": args.veyra_renderer,
+            "veyra_window_backend": os.environ.get("WINIT_UNIX_BACKEND", "auto"),
+            "veyra_threads": args.veyra_threads,
+            "veyra_thread_mode": args.veyra_thread_mode,
             "mpv_hwdec": args.mpv_hwdec,
+            "mpv_video_sync": args.mpv_video_sync,
         },
         "chart": None if args.no_chart else str(args.chart_output),
         "timeline_chart": None if args.no_chart else str(args.timeline_output),

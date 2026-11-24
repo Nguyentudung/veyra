@@ -10,7 +10,7 @@ fn submit(state: &mut State) {
     if source.is_empty() {
         return;
     }
-    state.scripts.eval(source);
+    state.eval_lua(source);
     state.lua_console_input.clear();
     state.status = "Lua command sent; inspect the launch terminal".into();
 }

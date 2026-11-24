@@ -37,6 +37,8 @@ pub struct StatisticsSnapshot {
     pub video_profile: Option<String>,
     pub video_pixel_format: Option<String>,
     pub video_decoder: Option<String>,
+    pub video_decode_threads: Option<u32>,
+    pub video_decode_thread_type: Option<String>,
     pub audio_codec: Option<String>,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<u32>,

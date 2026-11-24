@@ -127,6 +127,8 @@ impl StatisticsCollector {
             video_profile: snapshot.video_profile.clone(),
             video_pixel_format: snapshot.video_pixel_format.clone(),
             video_decoder: snapshot.video_decoder.clone(),
+            video_decode_threads: snapshot.video_decode_threads,
+            video_decode_thread_type: snapshot.video_decode_thread_type.clone(),
             audio_codec: snapshot.audio_codec.clone(),
             audio_sample_rate: snapshot.audio_sample_rate,
             audio_channels: snapshot.audio_channels,

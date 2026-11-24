@@ -58,6 +58,8 @@ impl Decoder {
                 state.video_profile = codec_profile(video.context);
                 state.video_pixel_format = pixel_format(video.context);
                 state.video_decoder = Some("FFmpeg software decoder".into());
+                state.video_decode_threads = video.decode_threads;
+                state.video_decode_thread_type = video.decode_thread_type.clone();
             }
             if let Some(audio) = audio.as_ref() {
                 state.audio_codec = codec_name(audio.context);

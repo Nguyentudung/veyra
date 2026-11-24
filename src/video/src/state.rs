@@ -23,6 +23,8 @@ pub struct Snapshot {
     pub video_profile: Option<String>,
     pub video_pixel_format: Option<String>,
     pub video_decoder: Option<String>,
+    pub video_decode_threads: Option<u32>,
+    pub video_decode_thread_type: Option<String>,
     pub audio_output: Option<String>,
     pub video_frames_processed: u64,
     pub frame_processing_ms: Option<f64>,

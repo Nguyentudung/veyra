@@ -89,7 +89,7 @@ impl PresentationClock {
     }
 
     /// Reports diagnostic frames at a low rate without adding work per frame.
-    fn observe_diagnostic_frame(&mut self, frame: *const ffi::AVFrame) {
+    fn observe_diagnostic_frame(&mut self, frame: *const ffi::AVFrame, timestamp: f64) {
         self.diagnostics_frames = self.diagnostics_frames.saturating_add(1);
         let elapsed = self.diagnostics_started.elapsed();
         if elapsed < Duration::from_secs(1) {
@@ -97,10 +97,14 @@ impl PresentationClock {
         }
         unsafe {
             eprintln!(
-                "[video][{}] interval_ms={:.0} decoded_frames={} size={}x{} format={} strides=[{}, {}, {}]",
+                "[video][{}] interval_ms={:.0} decoded_frames={} timestamp={timestamp:.3} best_effort_pts={} frame_pts={} frame_time_base={}/{} size={}x{} format={} strides=[{}, {}, {}]",
                 self.diagnostics.label().unwrap_or("disabled"),
                 elapsed.as_secs_f64() * 1000.0,
                 self.diagnostics_frames,
+                (*frame).best_effort_timestamp,
+                (*frame).pts,
+                (*frame).time_base.num,
+                (*frame).time_base.den,
                 (*frame).width,
                 (*frame).height,
                 (*frame).format,
@@ -138,17 +142,17 @@ pub(crate) unsafe fn decode_video(
         let rendered = match clock.diagnostics() {
             // This probe does not touch the renderer at all.
             DiagnosticMode::DecodeOnly => {
-                clock.observe_diagnostic_frame(frame);
+                clock.observe_diagnostic_frame(frame, timestamp);
                 None
             }
-            // Match the software renderer's zero-filled BGRA allocation, but
-            // do not create a swscale context, scale pixels, or publish to Rune.
+            // Match the software renderer's BGRA allocation size, but do not
+            // create a swscale context, scale pixels, or publish to Rune.
             DiagnosticMode::AllocOnly => {
                 let bytes = ((*frame).width as usize)
                     .saturating_mul((*frame).height as usize)
                     .saturating_mul(4);
                 std::hint::black_box(vec![0_u8; bytes]);
-                clock.observe_diagnostic_frame(frame);
+                clock.observe_diagnostic_frame(frame, timestamp);
                 None
             }
             // Exercise sws_getContext, the BGRA allocation and sws_scale; drop
@@ -156,7 +160,7 @@ pub(crate) unsafe fn decode_video(
             DiagnosticMode::ScaleOnly => {
                 let converted = renderer.convert(frame, timestamp)?;
                 std::hint::black_box(converted);
-                clock.observe_diagnostic_frame(frame);
+                clock.observe_diagnostic_frame(frame, timestamp);
                 None
             }
             // Same as scale-only, but SoftwareRenderer places a canary after
@@ -165,7 +169,7 @@ pub(crate) unsafe fn decode_video(
             DiagnosticMode::ScaleGuard => {
                 let converted = renderer.convert(frame, timestamp)?;
                 std::hint::black_box(converted);
-                clock.observe_diagnostic_frame(frame);
+                clock.observe_diagnostic_frame(frame, timestamp);
                 None
             }
             // This is intentionally the ordinary renderer path, named so a
@@ -226,21 +230,43 @@ fn publish_frame(
 }
 
 unsafe fn timestamp_seconds(frame: *mut ffi::AVFrame, fallback: ffi::AVRational) -> f64 {
-    let pts = if (*frame).best_effort_timestamp != i64::MIN {
-        (*frame).best_effort_timestamp
-    } else {
-        (*frame).pts
-    };
-    let time_base = if (*frame).time_base.num > 0 && (*frame).time_base.den > 0 {
-        (*frame).time_base
-    } else {
-        fallback
-    };
-    if pts == i64::MIN || time_base.num <= 0 || time_base.den <= 0 {
+    timestamp_seconds_from_parts(
+        (*frame).best_effort_timestamp,
+        (*frame).pts,
+        fallback,
+        (*frame).time_base,
+    )
+}
+
+/// `best_effort_timestamp` is explicitly expressed in the stream time base.
+/// It must not be combined with `AVFrame::time_base`, which decoders and
+/// filters may set to a different value. `AVFrame::pts`, on the other hand,
+/// is expressed in the frame time base when one is supplied.
+fn timestamp_seconds_from_parts(
+    best_effort_timestamp: i64,
+    pts: i64,
+    stream_time_base: ffi::AVRational,
+    frame_time_base: ffi::AVRational,
+) -> f64 {
+    if best_effort_timestamp != i64::MIN {
+        return timestamp_in_time_base(best_effort_timestamp, stream_time_base);
+    }
+    let time_base = valid_time_base(frame_time_base)
+        .then_some(frame_time_base)
+        .unwrap_or(stream_time_base);
+    timestamp_in_time_base(pts, time_base)
+}
+
+fn timestamp_in_time_base(timestamp: i64, time_base: ffi::AVRational) -> f64 {
+    if timestamp == i64::MIN || time_base.num <= 0 || time_base.den <= 0 {
         0.0
     } else {
-        pts as f64 * time_base.num as f64 / time_base.den as f64
+        timestamp as f64 * time_base.num as f64 / time_base.den as f64
     }
+}
+
+fn valid_time_base(time_base: ffi::AVRational) -> bool {
+    time_base.num > 0 && time_base.den > 0
 }
 
 fn check(code: i32, operation: &str) -> Result<(), String> {
@@ -248,5 +274,30 @@ fn check(code: i32, operation: &str) -> Result<(), String> {
         Err(format!("{operation} failed ({code})"))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn time_base(num: i32, den: i32) -> ffi::AVRational {
+        ffi::AVRational { num, den }
+    }
+
+    #[test]
+    fn best_effort_timestamp_uses_the_stream_time_base() {
+        // A decoder/filter is allowed to set a frame time base that differs
+        // from the stream. best_effort_timestamp remains in stream units.
+        let seconds =
+            timestamp_seconds_from_parts(1_000, 2, time_base(1, 60_000), time_base(1, 120));
+        assert!((seconds - 1.0 / 60.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn raw_pts_uses_the_frame_time_base_when_best_effort_is_missing() {
+        let seconds =
+            timestamp_seconds_from_parts(i64::MIN, 2, time_base(1, 60_000), time_base(1, 120));
+        assert!((seconds - 1.0 / 60.0).abs() < 1e-12);
     }
 }

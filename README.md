@@ -1,6 +1,6 @@
 # Veyra
 
-Detailed technical documentation is organized in [docs/architecture.md](docs/architecture.md), [docs/playback.md](docs/playback.md), [docs/ui.md](docs/ui.md), [docs/platforms.md](docs/platforms.md), [docs/development.md](docs/development.md), and [docs/roadmap.md](docs/roadmap.md).
+Detailed technical documentation is organized in [docs/architecture.md](docs/architecture.md), [docs/playback.md](docs/playback.md), [docs/ui.md](docs/ui.md), [docs/platforms.md](docs/platforms.md), [docs/development.md](docs/development.md), [docs/performance.md](docs/performance.md), and [docs/roadmap.md](docs/roadmap.md).
 
 Veyra is a native desktop media player written in Rust with Rune and Rune Kit. First-party application code is consolidated under the root `src/` directory: each domain is an independent Cargo crate in `src/<crate>/`, while `src/main.rs` remains the executable entry point.
 
@@ -41,11 +41,15 @@ Run the workspace with `cargo run` and test all crates with `cargo test --worksp
 The test-data harness is documented in [benchmarks/README.md](benchmarks/README.md).
 It is deliberately outside `src/`, because it is not part of the shipped
 application. It uses Python plus `matplotlib` to write a JSON log and PNG chart
-under the repository-root `log/` directory. After building Veyra, run:
+under the repository-root `log/` directory, including player-side FPS and
+frame-drop telemetry. To build Veyra if needed and run on the active desktop:
 
 ```sh
-python3 benchmarks/benchmark.py --runs 3
+make benchmark
 ```
+
+For headless Xvfb automation, use `make benchmark-headless` instead; it forces
+the X11 backend rather than inheriting a Wayland socket.
 
 ## Architecture and research
 

@@ -4,6 +4,7 @@ use super::gpu::GpuRenderer;
 use super::gpu_native::NativeGpuRenderer;
 use super::gpu_video::NativeVideoRenderer;
 use crate::GpuContext;
+use std::mem::MaybeUninit;
 
 // libswscale can use vector stores past the final visible BGRA pixel. Keep its
 // rows 64-byte aligned, then pack them before the existing tight ByteFrame API.
@@ -66,14 +67,28 @@ impl SoftwareRenderer {
         let scaled_bytes = output_stride
             .checked_mul(height)
             .ok_or("software frame buffer size overflow")?;
-        let mut rgba = vec![0u8; scaled_bytes];
+        // sws_scale overwrites every visible output pixel. Allocating an
+        // already-zeroed 4K BGRA frame first made the allocator touch tens of
+        // MiB per second only for the scaler to overwrite it immediately.
+        // Keep the allocation explicitly uninitialised until FFmpeg has
+        // reported a full-height conversion; padding is never read.
+        let allocation_bytes = scaled_bytes
+            .checked_add(self.output_guard_bytes)
+            .ok_or("software frame allocation size overflow")?;
+        let mut rgba = Vec::<MaybeUninit<u8>>::with_capacity(allocation_bytes);
+        // Safety: bytes are either written by sws_scale before being read, or
+        // remain MaybeUninit and are never exposed as u8. The optional guard
+        // is initialized explicitly below.
+        unsafe { rgba.set_len(allocation_bytes) };
         if self.output_guard_bytes != 0 {
             // Use a non-zero pattern: a zero-filled guard could fail to detect
             // an overrun made solely of zero-valued color components.
-            rgba.resize(scaled_bytes + self.output_guard_bytes, 0xA5);
+            for byte in &mut rgba[scaled_bytes..] {
+                byte.write(0xA5);
+            }
         }
         let mut data = [
-            rgba.as_mut_ptr(),
+            rgba.as_mut_ptr().cast::<u8>(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -100,13 +115,18 @@ impl SoftwareRenderer {
         }
         let guard = &rgba[scaled_bytes..];
         if self.output_guard_bytes != 0
-            && let Some(first_changed) = guard.iter().position(|byte| *byte != 0xA5)
+            && let Some(first_changed) = guard
+                .iter()
+                .position(|byte| unsafe { byte.assume_init() } != 0xA5)
         {
             let last_changed = guard
                 .iter()
-                .rposition(|byte| *byte != 0xA5)
+                .rposition(|byte| unsafe { byte.assume_init() } != 0xA5)
                 .unwrap_or(first_changed);
-            let changed_bytes = guard.iter().filter(|byte| **byte != 0xA5).count();
+            let changed_bytes = guard
+                .iter()
+                .filter(|byte| unsafe { byte.assume_init() } != 0xA5)
+                .count();
             return Err(format!(
                 "sws_scale wrote beyond the {scaled_bytes}-byte BGRA destination (guard changed: {changed_bytes} bytes, first: {first_changed}, last: {last_changed}, guard: {} bytes)",
                 self.output_guard_bytes,
@@ -116,14 +136,29 @@ impl SoftwareRenderer {
         // away only the alignment padding that libswscale needs internally.
         if output_stride == tight_stride {
             rgba.truncate(image_bytes);
+            // The visible output is fully initialized after a successful
+            // full-height sws_scale call. MaybeUninit<u8> has the same layout
+            // as u8, so transfer this allocation without a second copy.
+            let capacity = rgba.capacity();
+            let length = rgba.len();
+            let pointer = rgba.as_mut_ptr().cast::<u8>();
+            std::mem::forget(rgba);
+            let rgba = unsafe { Vec::from_raw_parts(pointer, length, capacity) };
             return Ok((rgba, width as u32, height as u32));
         }
         let mut packed = vec![0u8; image_bytes];
         for row in 0..height {
             let source_start = row * output_stride;
             let target_start = row * tight_stride;
-            packed[target_start..target_start + tight_stride]
-                .copy_from_slice(&rgba[source_start..source_start + tight_stride]);
+            // sws_scale initialized every visible row above. Padding remains
+            // MaybeUninit and is deliberately excluded from this slice.
+            let source = unsafe {
+                std::slice::from_raw_parts(
+                    rgba.as_ptr().add(source_start).cast::<u8>(),
+                    tight_stride,
+                )
+            };
+            packed[target_start..target_start + tight_stride].copy_from_slice(source);
         }
         Ok((packed, width as u32, height as u32))
     }

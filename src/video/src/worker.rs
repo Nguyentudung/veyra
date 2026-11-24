@@ -120,6 +120,8 @@ fn handle_command(
                     state.audio_processing_ms = None;
                     state.video_profile = metadata.video_profile;
                     state.video_pixel_format = metadata.video_pixel_format;
+                    state.video_decode_threads = metadata.video_decode_threads;
+                    state.video_decode_thread_type = metadata.video_decode_thread_type;
                 }
                 Err(error) => snapshot.lock().unwrap().error = Some(error),
             }

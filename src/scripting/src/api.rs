@@ -25,6 +25,8 @@ pub fn statistics_table(lua: &Lua, stats: &StatisticsSnapshot) -> Result<Table> 
     video.set("profile", stats.video_profile.clone())?;
     video.set("pixel_format", stats.video_pixel_format.clone())?;
     video.set("decoder", stats.video_decoder.clone())?;
+    video.set("decode_threads", stats.video_decode_threads)?;
+    video.set("decode_thread_type", stats.video_decode_thread_type.clone())?;
     let audio = lua.create_table()?;
     audio.set("codec", stats.audio_codec.clone())?;
     audio.set("sample_rate", stats.audio_sample_rate)?;

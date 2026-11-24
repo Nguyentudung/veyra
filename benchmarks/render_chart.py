@@ -48,6 +48,8 @@ class BarMetric:
     criterion: str
     axis_label: str
     value_from_run: Callable[[dict[str, Any]], float]
+    higher_is_better: bool = False
+    allow_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,7 @@ class TimeMetric:
     title: str
     criterion: str
     axis_label: str
+    sample_collection: str
     sample_key: str
     transform: Callable[[float], float]
 
@@ -88,6 +91,19 @@ BAR_METRICS = (
         "PSS trung vị mỗi lượt (MiB)",
         lambda run: float(run["metrics"]["memory_kib"]["pss_kib"]["median"]) / 1024.0,
     ),
+    BarMetric(
+        "E",
+        "FPS phát video",
+        (
+            "Veyra: khung video được giao cho NativeSurface / giây; mpv: ước lượng "
+            "display-sync, giới hạn không quá refresh (min(refresh, refresh / vsync ratio)). "
+            "mpv N/A khi display-sync không khả dụng."
+        ),
+        "FPS (khung/giây)",
+        lambda run: float(run["playback_metrics"]["playback_fps"]),
+        higher_is_better=True,
+        allow_missing=True,
+    ),
 )
 
 TIME_METRICS = (
@@ -95,6 +111,7 @@ TIME_METRICS = (
         "Diễn biến mức sử dụng CPU",
         "CPU của tiến trình theo từng khoảng trong cửa sổ đo",
         "Mức sử dụng CPU (% của một lõi)",
+        "memory_samples_kib",
         "cpu_percent",
         lambda value: value,
     ),
@@ -102,6 +119,7 @@ TIME_METRICS = (
         "Diễn biến bộ nhớ RSS",
         "RSS được lấy mẫu trong khi phát",
         "Bộ nhớ RSS (MiB)",
+        "memory_samples_kib",
         "rss_kib",
         lambda value: value / 1024.0,
     ),
@@ -109,8 +127,21 @@ TIME_METRICS = (
         "Diễn biến bộ nhớ PSS",
         "PSS được lấy mẫu trong khi phát",
         "Bộ nhớ PSS (MiB)",
+        "memory_samples_kib",
         "pss_kib",
         lambda value: value / 1024.0,
+    ),
+    TimeMetric(
+        "Diễn biến FPS phát video",
+        (
+            "Veyra: delta khung được giao / giây; mpv: display-sync estimate giới hạn "
+            "theo refresh. "
+            "Đường mpv vắng mặt khi hệ thống không có display-sync."
+        ),
+        "FPS (khung/giây)",
+        "playback_samples",
+        "playback_fps",
+        lambda value: value,
     ),
 )
 
@@ -132,12 +163,18 @@ def run_values(document: dict[str, Any], player: str, metric: BarMetric) -> list
         raise ValueError(f"benchmark JSON is missing runs for {player}") from error
     if not runs:
         raise ValueError(f"benchmark JSON has no completed runs for {player}")
+    values: list[float] = []
     try:
-        return [metric.value_from_run(run) for run in runs]
+        for run in runs:
+            value = metric.value_from_run(run)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError("value is not numeric")
+            values.append(float(value))
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(
             f"benchmark JSON has no usable {metric.title.lower()} data for {player}"
         ) from error
+    return values
 
 
 def style_axis(axis: Any) -> None:
@@ -161,21 +198,43 @@ def protocol_text(document: dict[str, Any]) -> str:
         f"Cửa sổ đo: {configuration.get('sample_seconds', 'không rõ')} giây  |  "
         f"Chu kỳ lấy mẫu: {configuration.get('sample_interval_seconds', 'không rõ')} giây\n"
         f"Trình dựng Veyra: {configuration.get('veyra_renderer', 'không rõ')}  |  "
-        f"Giải mã phần cứng mpv: {configuration.get('mpv_hwdec', 'không rõ')}"
+        f"Backend cửa sổ Veyra: {configuration.get('veyra_window_backend', 'auto')}  |  "
+        f"Giải mã phần cứng mpv: {configuration.get('mpv_hwdec', 'không rõ')}  |  "
+        f"Đồng bộ video mpv: {configuration.get('mpv_video_sync', 'không rõ')}"
     )
 
 
 def draw_bar_metric(axis: Any, document: dict[str, Any], metric: BarMetric) -> None:
-    values = [statistics.median(run_values(document, player, metric)) for player in PLAYERS]
+    values: list[float | None] = []
+    for player in PLAYERS:
+        try:
+            values.append(statistics.median(run_values(document, player, metric)))
+        except ValueError:
+            if not metric.allow_missing:
+                raise
+            values.append(None)
+    visible_values = [value for value in values if value is not None]
+    bar_values = [value if value is not None else 0.0 for value in values]
     bars = axis.bar(
         [PLAYER_LABELS[player] for player in PLAYERS],
-        values,
+        bar_values,
         color=[PLAYER_COLORS[player] for player in PLAYERS],
         width=0.56,
     )
-    axis.set_ylim(0, max(values) * 1.22 if max(values) > 0 else 1.0)
+    for bar, value in zip(bars, values, strict=True):
+        if value is None:
+            bar.set_hatch("//")
+            bar.set_alpha(0.45)
+    maximum = max(visible_values) if visible_values else 0.0
+    axis.set_ylim(0, maximum * 1.22 if maximum > 0 else 1.0)
     axis.set_ylabel(metric.axis_label, color=TEXT, fontsize=10)
-    axis.bar_label(bars, labels=[f"{value:.2f}" for value in values], padding=5, color=TEXT, fontsize=9)
+    axis.bar_label(
+        bars,
+        labels=["N/A" if value is None else f"{value:.2f}" for value in values],
+        padding=5,
+        color=TEXT,
+        fontsize=9,
+    )
     style_axis(axis)
 
 
@@ -206,7 +265,7 @@ def draw_bar_section_header(axis: Any, metric: BarMetric) -> None:
         0.0,
         0.10,
         f"Thống kê: trung vị giữa các lượt chạy.  Đơn vị: {metric.axis_label}.  "
-        "Giá trị thấp hơn tốt hơn.",
+        f"{'Giá trị cao hơn tốt hơn.' if metric.higher_is_better else 'Giá trị thấp hơn tốt hơn.'}",
         color=MUTED,
         fontsize=9.5,
         ha="left",
@@ -216,7 +275,7 @@ def draw_bar_section_header(axis: Any, metric: BarMetric) -> None:
 
 
 def render_bar_summary(document: dict[str, Any], output: Path) -> None:
-    figure = plt.figure(figsize=(13.5, 20), facecolor="white")
+    figure = plt.figure(figsize=(13.5, 4.0 * len(BAR_METRICS) + 4), facecolor="white")
     figure.suptitle(
         "So sánh Veyra và mpv — tổng hợp benchmark (biểu đồ cột)",
         color=TEXT,
@@ -228,14 +287,14 @@ def render_bar_summary(document: dict[str, Any], output: Path) -> None:
     )
     figure.text(0.07, 0.93, protocol_text(document), color=MUTED, fontsize=9.5, va="top")
     grid = figure.add_gridspec(
-        8,
+        len(BAR_METRICS) * 2,
         1,
         left=0.12,
         right=0.96,
         top=0.89,
         bottom=0.09,
         hspace=0.20,
-        height_ratios=(0.34, 1.0, 0.34, 1.0, 0.34, 1.0, 0.34, 1.0),
+        height_ratios=tuple(value for _ in BAR_METRICS for value in (0.34, 1.0)),
     )
     for index, metric in enumerate(BAR_METRICS):
         draw_bar_section_header(figure.add_subplot(grid[index * 2]), metric)
@@ -257,7 +316,7 @@ def aggregate_time_series(
 ) -> tuple[list[float], list[float], list[float], list[float]] | None:
     series_by_run: list[list[tuple[float, float]]] = []
     for run in document["runs"][player]:
-        samples = run.get("metrics", {}).get("memory_samples_kib", [])
+        samples = run.get("metrics", {}).get(metric.sample_collection, [])
         series = [
             (float(sample["elapsed_seconds"]), metric.transform(float(sample[metric.sample_key])))
             for sample in samples
@@ -330,7 +389,9 @@ def draw_time_metric(axis: Any, document: dict[str, Any], metric: TimeMetric) ->
 
 
 def render_timeline(document: dict[str, Any], output: Path) -> None:
-    figure, axes = plt.subplots(3, 1, figsize=(13.5, 15), facecolor="white")
+    figure, axes = plt.subplots(
+        len(TIME_METRICS), 1, figsize=(13.5, 5.0 * len(TIME_METRICS)), facecolor="white"
+    )
     figure.suptitle(
         "So sánh Veyra và mpv — diễn biến thông số khi phát (biểu đồ đường)",
         color=TEXT,
@@ -372,7 +433,7 @@ def render_timeline(document: dict[str, Any], output: Path) -> None:
         color=MUTED,
         fontsize=8.5,
     )
-    figure.subplots_adjust(left=0.12, right=0.96, top=0.79, bottom=0.12, hspace=0.78)
+    figure.subplots_adjust(left=0.12, right=0.96, top=0.83, bottom=0.10, hspace=0.78)
     save_png(figure, output)
 
 

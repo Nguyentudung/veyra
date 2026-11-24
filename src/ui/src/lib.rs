@@ -41,6 +41,10 @@ const UI_STATE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 // Materializing a public statistics snapshot clones history and metadata, so
 // keep it aligned with the collector's 250 ms history cadence.
 const STATISTICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+// Loading user Lua files is disk-bound and creates a separate runtime thread.
+// Give video startup its first frame before doing that work; audio-only streams
+// still start scripting after this bounded delay.
+const SCRIPT_STARTUP_DEFER: Duration = Duration::from_secs(1);
 
 pub struct State {
     engine: Engine,
@@ -63,7 +67,10 @@ pub struct State {
     statistics: StatisticsSnapshot,
     next_ui_refresh: Instant,
     next_statistics_sample: Instant,
-    scripts: ScriptManager,
+    scripts: Option<ScriptManager>,
+    scripts_start_pending: bool,
+    scripts_start_deadline: Option<Instant>,
+    stream_frame_seen: bool,
     last_file_name: Option<String>,
     statistics_page: usize,
     options_open: bool,
@@ -106,7 +113,13 @@ impl State {
             statistics: StatisticsSnapshot::default(),
             next_ui_refresh: Instant::now(),
             next_statistics_sample: Instant::now(),
-            scripts: ScriptManager::new(StatisticsSnapshot::default()),
+            // Script loading touches the user configuration directory and
+            // starts a Lua thread. Defer it until playback has a first frame
+            // (or a bounded audio-only fallback deadline).
+            scripts: None,
+            scripts_start_pending: false,
+            scripts_start_deadline: None,
+            stream_frame_seen: false,
             last_file_name: None,
             statistics_page: 0,
             options_open: false,
@@ -121,6 +134,60 @@ impl State {
             open_path(&mut state, PathBuf::from(path));
         }
         state
+    }
+
+    fn ensure_scripts(&mut self) -> &ScriptManager {
+        if self.scripts.is_none() {
+            self.scripts = Some(ScriptManager::new(self.statistics.clone()));
+        }
+        self.scripts
+            .as_ref()
+            .expect("script manager is created before it is returned")
+    }
+
+    fn dispatch_script_event(&mut self, event: PlaybackEvent) {
+        let statistics = self.statistics.clone();
+        self.ensure_scripts().dispatch(event, statistics);
+    }
+
+    fn defer_script_start(&mut self, now: Instant) {
+        self.scripts_start_pending = true;
+        self.scripts_start_deadline = Some(now + SCRIPT_STARTUP_DEFER);
+    }
+
+    fn start_deferred_scripts_if_ready(&mut self, now: Instant) {
+        if !self.scripts_start_pending
+            || (!self.stream_frame_seen
+                && self
+                    .scripts_start_deadline
+                    .is_some_and(|deadline| now < deadline))
+        {
+            return;
+        }
+        self.scripts_start_pending = false;
+        self.scripts_start_deadline = None;
+        // A script runtime that did not exist at stream-open has no prior
+        // track context, so its first event is always Started.
+        self.dispatch_script_event(PlaybackEvent::Started);
+    }
+
+    fn start_deferred_scripts(&mut self) {
+        if !self.scripts_start_pending {
+            return;
+        }
+        self.scripts_start_pending = false;
+        self.scripts_start_deadline = None;
+        self.dispatch_script_event(PlaybackEvent::Started);
+    }
+
+    pub(crate) fn reload_scripts(&mut self) {
+        self.start_deferred_scripts();
+        self.ensure_scripts().reload();
+    }
+
+    pub(crate) fn eval_lua(&mut self, source: String) {
+        self.start_deferred_scripts();
+        self.ensure_scripts().eval(source);
     }
 }
 
@@ -144,6 +211,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         return if let Some(frame) = update.frame {
             let (timestamp, changed) = present_frame(state, frame);
             state.snapshot.position = timestamp;
+            state.start_deferred_scripts_if_ready(now);
             changed
         } else {
             false
@@ -164,6 +232,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
         // Statistics belong to one media stream. Reset before recording the
         // first rendered frame so a new track never inherits old history.
         state.collector.reset_stream();
+        state.stream_frame_seen = false;
     }
     state
         .collector
@@ -190,43 +259,46 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
             &snapshot,
             state.playlist.current_track().map(|t| t.path.as_path()),
         );
+        write_benchmark_metrics(&state.statistics);
         state.next_statistics_sample = now + STATISTICS_SAMPLE_INTERVAL;
     }
     if stream_changed {
-        if snapshot.file_name.is_some() {
-            let event = if state.last_file_name.is_some() {
-                PlaybackEvent::TrackChanged {
-                    file_name: snapshot.file_name.clone(),
-                }
+        if let Some(file_name) = snapshot.file_name.clone() {
+            if state.scripts.is_some() {
+                let event = if state.last_file_name.is_some() {
+                    PlaybackEvent::TrackChanged {
+                        file_name: Some(file_name),
+                    }
+                } else {
+                    PlaybackEvent::Started
+                };
+                state.dispatch_script_event(event);
             } else {
-                PlaybackEvent::Started
-            };
-            state.scripts.dispatch(event, state.statistics.clone());
+                state.defer_script_start(now);
+            }
+        } else {
+            state.scripts_start_pending = false;
+            state.scripts_start_deadline = None;
         }
         state.last_file_name = snapshot.file_name.clone();
     }
-    if position_jumped && snapshot.file_name.is_some() {
-        state.scripts.dispatch(
-            PlaybackEvent::Seeked {
-                position: snapshot.position,
-            },
-            state.statistics.clone(),
-        );
+    if position_jumped && snapshot.file_name.is_some() && state.scripts.is_some() {
+        state.dispatch_script_event(PlaybackEvent::Seeked {
+            position: snapshot.position,
+        });
     }
-    if state.last_paused != snapshot.paused && snapshot.file_name.is_some() {
-        state.scripts.dispatch(
-            if snapshot.paused {
-                PlaybackEvent::Paused
-            } else {
-                PlaybackEvent::Resumed
-            },
-            state.statistics.clone(),
-        );
+    if state.last_paused != snapshot.paused
+        && snapshot.file_name.is_some()
+        && state.scripts.is_some()
+    {
+        state.dispatch_script_event(if snapshot.paused {
+            PlaybackEvent::Paused
+        } else {
+            PlaybackEvent::Resumed
+        });
     }
-    if state.last_finished != snapshot.finished && snapshot.finished {
-        state
-            .scripts
-            .dispatch(PlaybackEvent::Finished, state.statistics.clone());
+    if state.last_finished != snapshot.finished && snapshot.finished && state.scripts.is_some() {
+        state.dispatch_script_event(PlaybackEvent::Finished);
     }
     if playback_state_changed
         || stream_changed
@@ -251,6 +323,7 @@ fn poll(state: &mut State, _: f64, tx: &mut Tx) -> bool {
     // Views read this cache instead of repeatedly locking and cloning the
     // worker snapshot during ordinary video frames.
     state.snapshot = snapshot;
+    state.start_deferred_scripts_if_ready(now);
     // Schedule only when this snapshot path ran. Re-arming a 250 ms fallback
     // on every 60 FPS source frame needlessly maintained many redundant
     // deadlines in Rune's event loop.
@@ -288,8 +361,11 @@ fn present_frame(state: &mut State, frame: VideoFrame) -> (f64, bool) {
     };
     let mut changed = first_frame;
     match result {
-        Ok(()) if first_frame => mark_benchmark_ready(),
-        Ok(()) => {}
+        Ok(()) if first_frame => {
+            state.stream_frame_seen = true;
+            mark_benchmark_ready();
+        }
+        Ok(()) => state.stream_frame_seen = true,
         Err(error) => {
             state.status = error;
             changed = true;
@@ -307,6 +383,62 @@ fn mark_benchmark_ready() {
     };
     if let Err(error) = std::fs::write(path, b"ready\n") {
         eprintln!("[benchmark] could not write Veyra ready marker: {error}");
+    }
+}
+
+/// Writes opt-in playback telemetry for the external benchmark harness. This
+/// path is never touched during ordinary playback, and it is sampled at the
+/// same 250 ms cadence as the statistics panel rather than per rendered frame.
+fn write_benchmark_metrics(statistics: &StatisticsSnapshot) {
+    let Some(path) = std::env::var_os("VEYRA_BENCHMARK_METRICS_FILE") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let number = |value: Option<f64>| {
+        value
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "null".into())
+    };
+    let document = format!(
+        concat!(
+            "{{\"schema_version\":1,",
+            "\"video_frames_processed\":{},",
+            "\"rendered_frames\":{},",
+            "\"render_fps\":{},",
+            "\"frame_interval_ms\":{},",
+            "\"frame_jitter_ms\":{},",
+            "\"frame_processing_ms\":{},",
+            "\"frame_processing_avg_ms\":{},",
+            "\"frame_processing_peak_ms\":{},",
+            "\"dropped_frames\":{},",
+            "\"decode_threads\":{}",
+            "}}\n"
+        ),
+        statistics.video_frames_processed,
+        statistics.rendered_frames,
+        number(statistics.render_fps),
+        number(statistics.frame_interval_ms),
+        number(statistics.frame_jitter_ms),
+        number(statistics.frame_processing_ms),
+        number(statistics.frame_processing_avg_ms),
+        number(statistics.frame_processing_peak_ms),
+        statistics
+            .dropped_frames
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".into()),
+        statistics
+            .video_decode_threads
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".into()),
+    );
+    // A replace keeps the Python reader from observing a partially-written
+    // JSON document while the app is still playing.
+    let temporary = path.with_extension("tmp");
+    if let Err(error) =
+        std::fs::write(&temporary, document).and_then(|()| std::fs::rename(&temporary, &path))
+    {
+        eprintln!("[benchmark] could not write playback metrics: {error}");
     }
 }
 
@@ -333,7 +465,7 @@ fn on_key(state: &mut State, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
             true
         }
         rune::Key::Text(value) if value.eq_ignore_ascii_case("r") => {
-            state.scripts.reload();
+            state.reload_scripts();
             state.status = "Tools reloaded".into();
             true
         }

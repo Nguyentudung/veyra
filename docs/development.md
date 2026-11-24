@@ -20,10 +20,28 @@ Keep UI state and intent in `src/ui/src/`, playlist state in `src/playlist/src/`
 
 ## Testing
 
-The Rune runtime provides deterministic headless rendering and tree inspection, but Veyra's automated tests remain playlist-only. Headless rendering validates the empty-state layout and accessibility tree, including the corner controls and central transport labels. The suite does not yet open real media, inspect decoded frames, exercise ALSA, validate end-to-end seeking, measure audio/video synchronization, or run a desktop GUI; those checks require an interactive media-open session.
+Run all deterministic checks with `make test`, or directly with:
 
-Add deterministic short audio/video fixtures and test decoder startup, frame production, audio conversion, repeated open/close, unsupported files, and seek behavior without requiring a desktop window in CI.
+```sh
+cargo test --workspace
+python3 -B -m unittest discover -s benchmarks -p 'test_*.py' -v
+```
+
+The Rust suite currently covers playlist behavior plus cache, mailbox,
+statistics, scripting, and decoder-threading policy. The Python suite verifies
+the benchmark result/telemetry parser without requiring a desktop window.
+Rune also provides deterministic headless rendering and tree inspection for UI
+work.
+
+Real media, ALSA, desktop composition, GPU upload, and audio/video
+synchronization still require an interactive session or an Xvfb/Mesa runner.
+Use `make benchmark` for that non-gating performance comparison; see
+`docs/performance.md` for the environment requirements and interpretation.
 
 ## Performance and maintainability
 
-Software decode/conversion and per-presented-frame BGRA allocation are current hot paths. The latest-frame slot is bounded to one frame but not by frame size, and blocking ALSA writes can dominate worker time. Rune consumes the moved frame through its own latest-wins native surface; profile before introducing frame reuse, bounded queues, or hardware acceleration.
+The latest-frame slot is bounded to one frame but not by frame size, and
+blocking ALSA writes can dominate worker time. Rune consumes the moved frame
+through its own latest-wins native surface; profile before introducing frame
+reuse, bounded queues, or hardware acceleration. Decoder threading and
+benchmark methodology are documented in `docs/performance.md`.
