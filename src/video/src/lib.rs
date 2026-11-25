@@ -14,6 +14,5 @@ pub(crate) mod worker;
 pub use commands::Command;
 pub use mailbox::{FrameMailbox, FrameUpdate, FrameWaker};
 pub use rendering::VideoFrame;
-pub use rune::native_surface::GpuContext;
 pub use state::Snapshot;
 pub use worker::run;

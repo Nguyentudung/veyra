@@ -2,12 +2,12 @@
 
 Detailed technical documentation is organized in [docs/architecture.md](docs/architecture.md), [docs/playback.md](docs/playback.md), [docs/ui.md](docs/ui.md), [docs/platforms.md](docs/platforms.md), [docs/development.md](docs/development.md), [docs/performance.md](docs/performance.md), and [docs/roadmap.md](docs/roadmap.md).
 
-Veyra is a native desktop media player written in Rust with Rune and Rune Kit. First-party application code is consolidated under the root `src/` directory: each domain is an independent Cargo crate in `src/<crate>/`, while `src/main.rs` remains the executable entry point.
+Veyra is a native desktop media player written in Rust with GPUI. First-party application code is consolidated under the root `src/` directory: each domain is an independent Cargo crate in `src/<crate>/`, while `src/main.rs` remains the executable entry point.
 
 The main crates are:
 
 - `src/app` — application bootstrap.
-- `src/ui` — Rune UI and overlay composition.
+- `src/ui` — GPUI desktop interface and overlay composition.
 - `src/playback` — engine façade and worker orchestration.
 - `src/video` — FFmpeg/ALSA demuxing, decoding, rendering, and audio output.
 - `src/statistics` and `src/scripting` — playback metrics and Lua tools.
@@ -17,7 +17,7 @@ The main crates are:
 ## Features
 
 - Local audio playback through FFmpeg/libswresample and ALSA
-- Local video decoding through FFmpeg/libswscale and in-window Rune native-surface frames
+- Local video decoding through FFmpeg/libswscale and in-window GPUI image presentation
 - Pause/resume, relative seeking, previous/next track navigation, mute, volume, and native fullscreen
 - Video-first desktop layout with floating transport controls and an opt-in playlist overlay
 - Playlist selection and wraparound playlist model
@@ -55,14 +55,14 @@ diagnostic-only for cross-player renderer RAM and physical-display FPS.
 
 ## Architecture and research
 
-`src/playlist/src/lib.rs` contains application-owned playlist logic. `src/video/src/` owns the isolated media worker, FFmpeg format/codec contexts, ALSA output, resampling, GPU YUV upload with a software fallback, and the synchronized one-frame mailbox. `src/ui/src/lib.rs` is the Rune state/view boundary and never performs decode or audio work. Rune Kit supplies the buttons, icon buttons and semantic visual tokens; Rune's `NativeSurface` receives the latest frame without a second UI-side pixel buffer.
+`src/playlist/src/lib.rs` contains application-owned playlist logic. `src/video/src/` owns the isolated media worker, FFmpeg format/codec contexts, ALSA output, resampling, and the synchronized one-frame mailbox. `src/ui/src/lib.rs` is the GPUI state/view boundary: it turns the worker's portable BGRA frame into a GPUI `RenderImage` and never performs decode or audio work. The interface contains the video canvas, floating transport controls, timeline, volume control, Statistics view, options menu, and Lua console.
 
 VLC, FFmpeg, Symphonia, and GStreamer source were evaluated for separation of input/demux, codec modules, clocks, outputs, and playlist orchestration. FFmpeg was selected for the Ubuntu MVP because its low-level libraries provide broad container/codec coverage. Veyra does not copy VLC, FFmpeg, Symphonia, or GStreamer source or assets.
 
 ## Dependency and license audit
 
 - Veyra: Apache-2.0.
-- Rune and Rune Kit: pinned to the `cca5df6fafb4721d96fe105f126ebfd2ec351bb6` development revision; both are pre-release MIT-licensed workspace crates.
+- GPUI: 0.2.2, used for the native window, layout, input, and image presentation.
 - FFmpeg shared libraries: LGPL-2.1-or-later in the Ubuntu configuration; exact build flags must be audited before redistribution. Some optional configurations are GPL, and codecs may carry separate patent obligations.
 - ALSA library: LGPL-2.1-or-later.
 - `bindgen`: build-time dependency used for generated FFmpeg/ALSA FFI.
@@ -70,8 +70,8 @@ VLC, FFmpeg, Symphonia, and GStreamer source were evaluated for separation of in
 
 ## Memory management
 
-`src/cache` provides an RAII `MemoryBudget`. The audio queue uses an 8 MiB budget in addition to its two-second frame limit, so queued samples cannot grow without bound. Reservations are released when queued chunks are dropped or played. This limits application-owned media buffers; the RSS reported by the OS also includes Rune, FFmpeg codec contexts, ALSA buffers, shared libraries, and allocator overhead, which a cache cannot reclaim while those components are active.
+`src/cache` provides an RAII `MemoryBudget`. The audio queue uses an 8 MiB budget in addition to its two-second frame limit, so queued samples cannot grow without bound. Reservations are released when queued chunks are dropped or played. This limits application-owned media buffers; the RSS reported by the OS also includes GPUI, FFmpeg codec contexts, ALSA buffers, shared libraries, and allocator overhead, which a cache cannot reclaim while those components are active.
 
 ## Current limitations
 
-Clock reporting and duration display, bounded packet/frame queues, drag-and-drop event wiring, subtitle/audio-track selection, and late-frame dropping remain next milestones. The current worker keeps decoding and blocking audio I/O off Rune's event loop and publishes frames through Rune's bounded latest-wins native surface.
+Clock reporting and duration display, bounded packet/frame queues, drag-and-drop event wiring, subtitle/audio-track selection, and late-frame dropping remain next milestones. The current worker keeps decoding and blocking audio I/O off GPUI's event loop and publishes frames through a bounded latest-wins mailbox.

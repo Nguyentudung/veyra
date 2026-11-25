@@ -13,7 +13,7 @@ struct Uniforms {
     radii: [f32; 4],
     clip: [f32; 4],
     fade: [u32; 4],
-    // format (0 BGRA, 1 video NV12, 2 full NV12), matrix (0 601, 1 709), transfer, alpha
+    // format (0 BGRA, 1 video NV12, 2 full NV12, 3 video planar, 4 full planar), matrix (0 601, 1 709), transfer, alpha
     color: [f32; 4],
     // Exact mapping flag, source dimensions, horizontal mirror flag.
     sampling: [f32; 4],
@@ -40,12 +40,14 @@ enum ImportedImage {
     Textures([wgpu::Texture; 2]),
     Gpu(Arc<GpuFrame>),
     GpuVideo(Arc<GpuVideoFrame>),
+    GpuPlanarVideo(Arc<GpuPlanarVideoFrame>),
 }
 #[derive(Clone, PartialEq)]
 enum BindingKey {
     Textures([wgpu::Texture; 2]),
     Gpu { pool_id: u64, slot: u32 },
     GpuVideo { pool_id: u64, slot: u32 },
+    GpuPlanarVideo { pool_id: u64, slot: u32 },
 }
 impl Imported {
     fn binding_key(&self) -> BindingKey {
@@ -56,6 +58,10 @@ impl Imported {
                 slot: frame.slot,
             },
             ImportedImage::GpuVideo(frame) => BindingKey::GpuVideo {
+                pool_id: frame.pool_id,
+                slot: frame.slot,
+            },
+            ImportedImage::GpuPlanarVideo(frame) => BindingKey::GpuPlanarVideo {
                 pool_id: frame.pool_id,
                 slot: frame.slot,
             },
@@ -321,8 +327,9 @@ impl SurfaceRenderer {
                 },
                 texture_entry(1),
                 texture_entry(2),
+                texture_entry(3),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -494,10 +501,12 @@ impl SurfaceRenderer {
                 clip: d.clip,
                 fade: d.fade,
                 color: [
-                    match f.format {
-                        Format::Bgra => 0.0,
-                        Format::Nv12Video => 1.0,
-                        Format::Nv12Full => 2.0,
+                    match (&imported.image, f.format) {
+                        (_, Format::Bgra) => 0.0,
+                        (ImportedImage::GpuPlanarVideo(_), Format::Nv12Video) => 3.0,
+                        (ImportedImage::GpuPlanarVideo(_), Format::Nv12Full) => 4.0,
+                        (_, Format::Nv12Video) => 1.0,
+                        (_, Format::Nv12Full) => 2.0,
                     },
                     if f.color.matrix == Matrix::Bt709 {
                         1.0
@@ -638,6 +647,7 @@ impl SurfaceRenderer {
             }
             Source::Gpu(frame) => ImportedImage::Gpu(frame.clone()),
             Source::GpuVideo(frame) => ImportedImage::GpuVideo(frame.clone()),
+            Source::GpuPlanarVideo(frame) => ImportedImage::GpuPlanarVideo(frame.clone()),
             #[cfg(target_os = "macos")]
             Source::PixelBuffer(b) => {
                 if self.importer.is_none() {
@@ -1048,17 +1058,21 @@ fn bind_group(
     imported: &Imported,
 ) -> wgpu::BindGroup {
     let owned;
-    let views: [&wgpu::TextureView; 2] = match &imported.image {
+    let views: [&wgpu::TextureView; 3] = match &imported.image {
         ImportedImage::Textures(textures) => {
             owned = textures
                 .each_ref()
                 .map(|texture| texture.create_view(&Default::default()));
-            [&owned[0], &owned[1]]
+            [&owned[0], &owned[1], &owned[1]]
         }
-        // BGRA's shader path samples only binding 1. Bind the same view at 2
-        // to preserve Rune's existing two-texture layout without a dummy GPU resource.
-        ImportedImage::Gpu(frame) => [&frame.view, &frame.view],
-        ImportedImage::GpuVideo(frame) => [&frame.planes[0], &frame.planes[1]],
+        // BGRA's shader path samples only binding 1. Bind the same view at
+        // chroma bindings to preserve the common layout without dummy GPU
+        // resources.
+        ImportedImage::Gpu(frame) => [&frame.view, &frame.view, &frame.view],
+        ImportedImage::GpuVideo(frame) => [&frame.planes[0], &frame.planes[1], &frame.planes[1]],
+        ImportedImage::GpuPlanarVideo(frame) => {
+            [&frame.planes[0], &frame.planes[1], &frame.planes[2]]
+        }
     };
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("video frame"),
@@ -1078,6 +1092,10 @@ fn bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 3,
+                resource: wgpu::BindingResource::TextureView(views[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],

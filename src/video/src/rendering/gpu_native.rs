@@ -94,7 +94,6 @@ pub(crate) struct NativeGpuRenderer {
     // fallback; normal positive-stride planes go straight to write_texture.
     plane_buffers: [Vec<u8>; 3],
     output_pool: Option<Arc<OutputPool>>,
-    next_pool_id: u64,
     submitted_frames: u64,
     starved_frames: u64,
 }
@@ -169,7 +168,6 @@ impl NativeGpuRenderer {
             plane_dimensions: (0, 0),
             plane_buffers: [Vec::new(), Vec::new(), Vec::new()],
             output_pool: None,
-            next_pool_id: 0,
             submitted_frames: 0,
             starved_frames: 0,
         })
@@ -295,7 +293,6 @@ impl NativeGpuRenderer {
         {
             return Arc::clone(pool);
         }
-        self.next_pool_id = self.next_pool_id.wrapping_add(1);
         let slots = (0..OUTPUT_SLOT_COUNT)
             .map(|slot| {
                 let texture = self
@@ -328,7 +325,7 @@ impl NativeGpuRenderer {
             })
             .collect();
         let pool = Arc::new(OutputPool {
-            id: self.next_pool_id,
+            id: super::next_pool_id(),
             size: [width, height],
             slots,
             free: Mutex::new((0..OUTPUT_SLOT_COUNT).collect()),

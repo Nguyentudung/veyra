@@ -4,9 +4,9 @@ This document incorporates the initial implementation audit. It distinguishes so
 
 ## Verified implementation
 
-- Modular Rust/Rune application startup.
+- Modular Rust/GPUI application startup.
 - Independent FFmpeg demux/codec path with no complete media-player subprocess.
-- Software video conversion to BGRA and Rune native-surface handoff.
+- Software video conversion to BGRA and GPUI image handoff.
 - libswresample plus ALSA audio path with volume/mute scaling.
 - Worker shutdown and native resource cleanup boundaries.
 - Playlist model and two passing unit tests.
@@ -24,6 +24,6 @@ This document incorporates the initial implementation audit. It distinguishes so
 1. Add deterministic audio/video fixtures and engine integration tests.
 2. Track stream time bases, populate duration/position, and correct relative seeking.
 3. Add bounded packet/audio/video queues and an audio-master/video-deadline scheduler.
-4. Verify ALSA and Rune behavior on Ubuntu with representative formats.
+4. Verify ALSA and GPUI behavior on Ubuntu with representative formats.
 5. Add timeline, keyboard shortcuts, drag/drop, next/previous, and playback completion navigation.
 6. Add subtitles, track selection, metadata, platform backends, and rendering/frame reuse.

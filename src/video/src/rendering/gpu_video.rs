@@ -1,38 +1,114 @@
-//! Direct NV12 texture handoff (Mode C).
+//! Direct YUV texture handoff (Mode C).
 //!
-//! The decoder worker uploads luma and interleaved chroma into a leased pair
-//! of textures on Rune's queue. Rune's existing NV12 compositor then performs
-//! YUV conversion, scaling and presentation in its normal render pass. There
-//! is intentionally no Veyra command encoder, GPU render pass or queue submit.
+//! The decoder worker uploads decoded luma/chroma into leased textures on
+//! Rune's queue. NV12 stays two-plane; YUV420P uploads its Cb and Cr planes
+//! directly, so it does not need a CPU-side chroma interleave. Rune's video
+//! compositor performs YUV conversion, scaling and presentation in its normal
+//! render pass. There is intentionally no Veyra command encoder, GPU render
+//! pass or queue submit.
 
 use super::{super::ffi, frame::VideoFrame};
 use rune::{
-    native_surface::{ColorInfo, Format, GpuContext, GpuVideoFrame, Matrix, Transfer},
+    native_surface::{
+        ColorInfo, Format, GpuContext, GpuPlanarVideoFrame, GpuVideoFrame, Matrix, Transfer,
+    },
     wgpu,
 };
 use std::{
     any::Any,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Instant,
 };
 
-// The latest-wins handoff needs one texture being uploaded, one in the
-// mailbox, and one still sampled by Rune. A fourth slot only masks a stalled
-// compositor while retaining another full NV12 picture for the whole session.
-// Keep the steady-state pool at three so the normal GPU path does not reserve
-// an extra 1.5 bytes/pixel of video memory.
+// Three slots cover the usual handoff. Rune may temporarily retain an older
+// frame in its prepared draw and completion callback while a newer one waits
+// in the mailbox. Reserve a fourth only when all three are leased, so high-rate
+// streams can keep advancing without paying for that texture on every video.
 const VIDEO_SLOT_COUNT: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlaneLayout {
+    Nv12,
+    Yuv420p,
+}
+
+impl PlaneLayout {
+    fn from_pixel_format(format: i32, planar: bool) -> Option<Self> {
+        match format {
+            ffi::AVPixelFormat_AV_PIX_FMT_NV12 => Some(Self::Nv12),
+            ffi::AVPixelFormat_AV_PIX_FMT_YUV420P if planar => Some(Self::Yuv420p),
+            ffi::AVPixelFormat_AV_PIX_FMT_YUV420P => Some(Self::Nv12),
+            _ => None,
+        }
+    }
+}
 
 struct PlaneSlot {
     _y: wgpu::Texture,
-    _uv: wgpu::Texture,
-    views: [wgpu::TextureView; 2],
+    chroma: ChromaPlanes,
+}
+
+enum ChromaPlanes {
+    Nv12 {
+        _uv: wgpu::Texture,
+        views: [wgpu::TextureView; 2],
+    },
+    Yuv420p {
+        _u: wgpu::Texture,
+        _v: wgpu::Texture,
+        views: [wgpu::TextureView; 3],
+    },
+}
+
+impl PlaneSlot {
+    fn frame(
+        &self,
+        size_px: [u32; 2],
+        format: Format,
+        color: ColorInfo,
+        generation: u64,
+        pool_id: u64,
+        slot: u32,
+        lease: Arc<dyn Any + Send + Sync>,
+        timestamp: f64,
+    ) -> VideoFrame {
+        match &self.chroma {
+            ChromaPlanes::Nv12 { views, .. } => VideoFrame::GpuVideo {
+                frame: GpuVideoFrame {
+                    planes: views.clone(),
+                    size_px,
+                    format,
+                    color,
+                    generation,
+                    pool_id,
+                    slot,
+                    lease,
+                },
+                timestamp,
+            },
+            ChromaPlanes::Yuv420p { views, .. } => VideoFrame::GpuPlanarVideo {
+                frame: GpuPlanarVideoFrame {
+                    planes: views.clone(),
+                    size_px,
+                    format,
+                    color,
+                    generation,
+                    pool_id,
+                    slot,
+                    lease,
+                },
+                timestamp,
+            },
+        }
+    }
 }
 
 struct PlanePool {
     id: u64,
     size: [u32; 2],
+    layout: PlaneLayout,
     slots: Vec<PlaneSlot>,
+    extra_slot: OnceLock<PlaneSlot>,
     free: Mutex<Vec<usize>>,
 }
 
@@ -42,6 +118,35 @@ impl PlanePool {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .pop()
+    }
+
+    fn take_slot_or_expand(&self, device: &wgpu::Device) -> Option<usize> {
+        if let Some(slot) = self.take_slot() {
+            return Some(slot);
+        }
+        // NativeVideoRenderer has a single producer thread; completion
+        // callbacks only return indices to `free`. Therefore this one-shot
+        // expansion cannot hand the extra slot to two uploaders.
+        if self.extra_slot.get().is_none() {
+            self.extra_slot
+                .get_or_init(|| plane_slot(device, self.size[0], self.size[1], self.layout));
+            eprintln!("[video] gpu-video: expanded output-plane pool to 4 slots");
+            Some(VIDEO_SLOT_COUNT)
+        } else {
+            self.take_slot()
+        }
+    }
+
+    fn slot(&self, index: usize) -> &PlaneSlot {
+        if index == VIDEO_SLOT_COUNT {
+            self.extra_slot.get().expect("expanded plane slot exists")
+        } else {
+            &self.slots[index]
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        VIDEO_SLOT_COUNT + usize::from(self.extra_slot.get().is_some())
     }
 }
 
@@ -66,31 +171,30 @@ impl Drop for SlotLease {
 pub(crate) struct NativeVideoRenderer {
     context: GpuContext,
     pool: Option<Arc<PlanePool>>,
-    next_pool_id: u64,
-    // This is the only per-frame CPU conversion for decoded YUV420P. It keeps
-    // capacity across frames and is not involved when FFmpeg supplies NV12.
+    planar_yuv420p: bool,
     uv_interleaved: Vec<u8>,
     y_fallback: Vec<u8>,
-    uv_fallback: Vec<u8>,
+    chroma_fallback: Vec<u8>,
     uploaded_frames: u64,
     starved_frames: u64,
-    last_interleave_ms: f64,
+    last_chroma_upload_ms: f64,
     last_upload_ms: f64,
 }
 
 impl NativeVideoRenderer {
     pub(crate) fn new(context: GpuContext) -> Result<Self, String> {
         context.compositor_diagnostics.set_renderer("gpu-video");
+        let planar_yuv420p = std::env::var("VEYRA_YUV420P_UPLOAD").as_deref() != Ok("interleaved");
         Ok(Self {
             context,
             pool: None,
-            next_pool_id: 0,
+            planar_yuv420p,
             uv_interleaved: Vec::new(),
             y_fallback: Vec::new(),
-            uv_fallback: Vec::new(),
+            chroma_fallback: Vec::new(),
             uploaded_frames: 0,
             starved_frames: 0,
-            last_interleave_ms: 0.0,
+            last_chroma_upload_ms: 0.0,
             last_upload_ms: 0.0,
         })
     }
@@ -114,14 +218,17 @@ impl NativeVideoRenderer {
         {
             return Err("video dimensions exceed Rune GPU texture limit".into());
         }
+        let layout = PlaneLayout::from_pixel_format((*frame).format, self.planar_yuv420p)
+            .ok_or("gpu-video supports only YUV420P and NV12")?;
         let (format, color) = color_info(frame, width, height)?;
-        let pool = self.ensure_pool(width, height);
-        let Some(slot) = pool.take_slot() else {
+        let pool = self.ensure_pool(width, height, layout);
+        let Some(slot) = pool.take_slot_or_expand(&self.context.device) else {
             self.starved_frames = self.starved_frames.saturating_add(1);
             if self.starved_frames % 60 == 1 {
                 eprintln!(
                     "[video] gpu-video: output-plane pool starved; dropped={} free_slots=0/{}",
-                    self.starved_frames, VIDEO_SLOT_COUNT
+                    self.starved_frames,
+                    pool.capacity()
                 );
             }
             return Ok(None);
@@ -134,7 +241,7 @@ impl NativeVideoRenderer {
         });
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
-        let slot_textures = &pool.slots[slot];
+        let slot_textures = pool.slot(slot);
         let upload_started = Instant::now();
         upload_r8_plane(
             &self.context.queue,
@@ -147,19 +254,21 @@ impl NativeVideoRenderer {
             &mut self.y_fallback,
         )?;
 
-        let interleave_started = Instant::now();
-        match (*frame).format {
-            ffi::AVPixelFormat_AV_PIX_FMT_NV12 => upload_rg8_plane(
-                &self.context.queue,
-                &self.context.compositor_diagnostics,
-                &slot_textures._uv,
-                (*frame).data[1],
-                (*frame).linesize[1],
-                chroma_width,
-                chroma_height,
-                &mut self.uv_fallback,
-            )?,
-            ffi::AVPixelFormat_AV_PIX_FMT_YUV420P => {
+        let chroma_started = Instant::now();
+        match (&slot_textures.chroma, (*frame).format) {
+            (ChromaPlanes::Nv12 { _uv, .. }, ffi::AVPixelFormat_AV_PIX_FMT_NV12) => {
+                upload_rg8_plane(
+                    &self.context.queue,
+                    &self.context.compositor_diagnostics,
+                    _uv,
+                    (*frame).data[1],
+                    (*frame).linesize[1],
+                    chroma_width,
+                    chroma_height,
+                    &mut self.chroma_fallback,
+                )?
+            }
+            (ChromaPlanes::Nv12 { _uv, .. }, ffi::AVPixelFormat_AV_PIX_FMT_YUV420P) => {
                 interleave_yuv420p(
                     (*frame).data[1],
                     (*frame).linesize[1],
@@ -172,78 +281,73 @@ impl NativeVideoRenderer {
                 write_texture(
                     &self.context.queue,
                     &self.context.compositor_diagnostics,
-                    &slot_textures._uv,
+                    _uv,
                     &self.uv_interleaved,
                     chroma_width * 2,
                     chroma_width,
                     chroma_height,
                 );
             }
-            _ => return Err("gpu-video supports only YUV420P and NV12".into()),
+            (ChromaPlanes::Yuv420p { _u, _v, .. }, ffi::AVPixelFormat_AV_PIX_FMT_YUV420P) => {
+                upload_r8_plane(
+                    &self.context.queue,
+                    &self.context.compositor_diagnostics,
+                    _u,
+                    (*frame).data[1],
+                    (*frame).linesize[1],
+                    chroma_width,
+                    chroma_height,
+                    &mut self.chroma_fallback,
+                )?;
+                upload_r8_plane(
+                    &self.context.queue,
+                    &self.context.compositor_diagnostics,
+                    _v,
+                    (*frame).data[2],
+                    (*frame).linesize[2],
+                    chroma_width,
+                    chroma_height,
+                    &mut self.chroma_fallback,
+                )?;
+            }
+            _ => return Err("gpu-video plane layout changed while uploading".into()),
         }
-        self.last_interleave_ms = interleave_started.elapsed().as_secs_f64() * 1000.0;
+        self.last_chroma_upload_ms = chroma_started.elapsed().as_secs_f64() * 1000.0;
         self.last_upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
 
         // `write_texture` work is submitted by Rune's next compositor submit
         // on this same queue. No producer-side encoder or submission exists.
         self.uploaded_frames = self.uploaded_frames.saturating_add(1);
         self.log_diagnostics();
-        Ok(Some(VideoFrame::GpuVideo {
-            frame: GpuVideoFrame {
-                planes: slot_textures.views.clone(),
-                size_px: pool.size,
-                format,
-                color,
-                generation: self.context.generation,
-                pool_id: pool.id,
-                slot: slot as u32,
-                lease,
-            },
+        Ok(Some(slot_textures.frame(
+            pool.size,
+            format,
+            color,
+            self.context.generation,
+            pool.id,
+            slot as u32,
+            lease,
             timestamp,
-        }))
+        )))
     }
 
-    fn ensure_pool(&mut self, width: u32, height: u32) -> Arc<PlanePool> {
+    fn ensure_pool(&mut self, width: u32, height: u32, layout: PlaneLayout) -> Arc<PlanePool> {
         if let Some(pool) = self
             .pool
             .as_ref()
-            .filter(|pool| pool.size == [width, height])
+            .filter(|pool| pool.size == [width, height] && pool.layout == layout)
         {
             return Arc::clone(pool);
         }
-        self.next_pool_id = self.next_pool_id.wrapping_add(1);
-        let device = &self.context.device;
         let slots = (0..VIDEO_SLOT_COUNT)
-            .map(|_| {
-                let y = plane_texture(
-                    device,
-                    "veyra-video-y",
-                    width,
-                    height,
-                    wgpu::TextureFormat::R8Unorm,
-                );
-                let uv = plane_texture(
-                    device,
-                    "veyra-video-uv",
-                    width.div_ceil(2),
-                    height.div_ceil(2),
-                    wgpu::TextureFormat::Rg8Unorm,
-                );
-                let views = [
-                    y.create_view(&Default::default()),
-                    uv.create_view(&Default::default()),
-                ];
-                PlaneSlot {
-                    _y: y,
-                    _uv: uv,
-                    views,
-                }
-            })
+            .map(|_| plane_slot(&self.context.device, width, height, layout))
             .collect();
         let pool = Arc::new(PlanePool {
-            id: self.next_pool_id,
+            id: super::next_pool_id(),
             size: [width, height],
+            layout,
             slots,
+            extra_slot: OnceLock::new(),
             free: Mutex::new((0..VIDEO_SLOT_COUNT).collect()),
         });
         self.pool = Some(Arc::clone(&pool));
@@ -259,17 +363,75 @@ impl NativeVideoRenderer {
                     .len()
             });
             eprintln!(
-                "[video] gpu-video: uploaded={} starved={} free_slots={}/{} upload_ms={:.2} interleave_ms={:.2} pool_id={}",
+                "[video] gpu-video: uploaded={} starved={} free_slots={}/{} upload_ms={:.2} chroma_upload_ms={:.2} pool_id={}",
                 self.uploaded_frames,
                 self.starved_frames,
                 free,
-                VIDEO_SLOT_COUNT,
+                self.pool
+                    .as_ref()
+                    .map_or(VIDEO_SLOT_COUNT, |pool| pool.capacity()),
                 self.last_upload_ms,
-                self.last_interleave_ms,
+                self.last_chroma_upload_ms,
                 self.pool.as_ref().map_or(0, |pool| pool.id),
             );
         }
     }
+}
+
+fn plane_slot(device: &wgpu::Device, width: u32, height: u32, layout: PlaneLayout) -> PlaneSlot {
+    let y = plane_texture(
+        device,
+        "veyra-video-y",
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    );
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let chroma = match layout {
+        PlaneLayout::Nv12 => {
+            let uv = plane_texture(
+                device,
+                "veyra-video-uv",
+                chroma_width,
+                chroma_height,
+                wgpu::TextureFormat::Rg8Unorm,
+            );
+            ChromaPlanes::Nv12 {
+                views: [
+                    y.create_view(&Default::default()),
+                    uv.create_view(&Default::default()),
+                ],
+                _uv: uv,
+            }
+        }
+        PlaneLayout::Yuv420p => {
+            let u = plane_texture(
+                device,
+                "veyra-video-u",
+                chroma_width,
+                chroma_height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            let v = plane_texture(
+                device,
+                "veyra-video-v",
+                chroma_width,
+                chroma_height,
+                wgpu::TextureFormat::R8Unorm,
+            );
+            ChromaPlanes::Yuv420p {
+                views: [
+                    y.create_view(&Default::default()),
+                    u.create_view(&Default::default()),
+                    v.create_view(&Default::default()),
+                ],
+                _u: u,
+                _v: v,
+            }
+        }
+    };
+    PlaneSlot { _y: y, chroma }
 }
 
 fn plane_texture(
@@ -416,12 +578,37 @@ unsafe fn interleave_yuv420p(
         let u_row = u.offset(row as isize * u_stride as isize);
         let v_row = v.offset(row as isize * v_stride as isize);
         let dst = out.as_mut_ptr().add(row * width as usize * 2);
-        for column in 0..width as usize {
-            *dst.add(column * 2) = *u_row.add(column);
-            *dst.add(column * 2 + 1) = *v_row.add(column);
-        }
+        interleave_chroma_row(u_row, v_row, dst, width as usize);
     }
     Ok(())
+}
+
+unsafe fn interleave_chroma_row(u: *const u8, v: *const u8, dst: *mut u8, width: usize) {
+    let mut column = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            __m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+        };
+        while column + 16 <= width {
+            let u_bytes = _mm_loadu_si128(u.add(column).cast::<__m128i>());
+            let v_bytes = _mm_loadu_si128(v.add(column).cast::<__m128i>());
+            _mm_storeu_si128(
+                dst.add(column * 2).cast::<__m128i>(),
+                _mm_unpacklo_epi8(u_bytes, v_bytes),
+            );
+            _mm_storeu_si128(
+                dst.add(column * 2 + 16).cast::<__m128i>(),
+                _mm_unpackhi_epi8(u_bytes, v_bytes),
+            );
+            column += 16;
+        }
+    }
+    while column < width {
+        *dst.add(column * 2) = *u.add(column);
+        *dst.add(column * 2 + 1) = *v.add(column);
+        column += 1;
+    }
 }
 
 fn write_texture(
@@ -453,6 +640,72 @@ fn write_texture(
         },
     );
     diagnostics.record_write_texture();
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{PlaneLayout, ffi, interleave_yuv420p};
+
+    #[test]
+    fn direct_upload_selects_the_matching_plane_layout() {
+        assert_eq!(
+            PlaneLayout::from_pixel_format(ffi::AVPixelFormat_AV_PIX_FMT_NV12, true),
+            Some(PlaneLayout::Nv12)
+        );
+        assert_eq!(
+            PlaneLayout::from_pixel_format(ffi::AVPixelFormat_AV_PIX_FMT_YUV420P, true),
+            Some(PlaneLayout::Yuv420p)
+        );
+        assert_eq!(
+            PlaneLayout::from_pixel_format(ffi::AVPixelFormat_AV_PIX_FMT_YUV420P, false),
+            Some(PlaneLayout::Nv12)
+        );
+        assert_eq!(PlaneLayout::from_pixel_format(-1, true), None);
+    }
+
+    #[test]
+    fn interleave_handles_padding_negative_strides_and_simd_tails() {
+        for width in [1_usize, 15, 16, 17, 31, 32, 33] {
+            let pitch = width + 3;
+            let mut u = vec![0_u8; pitch * 2];
+            let mut v = vec![0_u8; pitch * 2];
+            for row in 0..2 {
+                for col in 0..width {
+                    u[row * pitch + col] = (row * 31 + col) as u8;
+                    v[row * pitch + col] = (row * 47 + col * 2) as u8;
+                }
+            }
+            for negative in [false, true] {
+                let start = if negative { pitch } else { 0 };
+                let stride = if negative {
+                    -(pitch as i32)
+                } else {
+                    pitch as i32
+                };
+                let mut actual = Vec::new();
+                unsafe {
+                    interleave_yuv420p(
+                        u.as_ptr().add(start),
+                        stride,
+                        v.as_ptr().add(start),
+                        stride,
+                        width as u32,
+                        2,
+                        &mut actual,
+                    )
+                    .unwrap();
+                }
+                let mut expected = Vec::new();
+                for row in 0..2 {
+                    let src = if negative { 1 - row } else { row };
+                    for col in 0..width {
+                        expected.extend_from_slice(&[u[src * pitch + col], v[src * pitch + col]]);
+                    }
+                }
+                assert_eq!(actual, expected, "width={width}, negative={negative}");
+            }
+        }
+    }
 }
 
 unsafe fn color_info(

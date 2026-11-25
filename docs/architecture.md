@@ -32,7 +32,7 @@ Status labels: **Implemented**, **Partially Implemented**, **Planned**, and **Ne
 └── video_test/
 ```
 
-`src/main.rs` only starts `veyra_app::run`. `src/app/src/lib.rs` is the application bootstrap. `src/ui/src/lib.rs` owns the video-first state-driven view, Rune Kit composition, floating overlays, input handlers, chooser integration, and the playback-to-surface handoff. `src/ui/src/lucide.rs` contains the embedded icon set and `src/ui/src/theme.rs` contains shared glass styling. `src/playback/src/lib.rs` exposes the playback façade; `src/video/src/` owns native media and device implementation details. `src/playlist/src/lib.rs` owns track data and selection. `benchmarks/` stays outside this tree because it only collects test data.
+`src/main.rs` only starts `veyra_app::run`. `src/app/src/lib.rs` is the application bootstrap. `src/ui/src/lib.rs` owns the complete GPUI video-first view, floating overlays, input handlers, chooser integration, and the playback-to-image handoff. `src/playback/src/lib.rs` exposes the playback façade; `src/video/src/` owns native media and device implementation details. `src/playlist/src/lib.rs` owns track data and selection. `benchmarks/` stays outside this tree because it only collects test data.
 
 ## Engine boundaries
 
@@ -49,20 +49,20 @@ Status labels: **Implemented**, **Partially Implemented**, **Planned**, and **Ne
 
 ```mermaid
 flowchart LR
-  UI[Rune UI + Rune Kit] -->|Command| W[video worker]
+  UI[GPUI interface] -->|Command| W[video worker]
   W --> D[demuxer]
   D --> AC[audio codec]
   D --> VC[video codec]
   AC --> R[resampler]
   R --> A[ALSA output]
-  VC --> S[YUV GPU renderer]
-  S --> F[GpuVideoFrame / BGRA fallback]
-  F --> NS[Rune NativeSurface]
-  NS --> UI
+  VC --> S[software BGRA renderer]
+  S --> F[BGRA frame]
+  F --> I[GPUI RenderImage]
+  I --> UI
 ```
 
 ## Ownership and concurrency
 
-`Engine` in `src/playback/src/lib.rs` owns a command sender, mutex-protected snapshot handle, `FrameMailbox`, and one named `veyra-media-engine` thread. The worker in `src/video/src/worker.rs` owns `Decoder`; dropping/replacing it releases FFmpeg, swscale, swresample, and ALSA resources. Rune never receives native decoder or device pointers. The mailbox and `NativeSurface` are both latest-wins slots: publishing a new frame replaces an older unpresented frame. `PresentationClock` in `src/video/src/rendering/decoder.rs` applies decoded PTS values in stream time-base seconds before a frame is published, so packet decode speed does not determine playback speed.
+`Engine` in `src/playback/src/lib.rs` owns a command sender, mutex-protected snapshot handle, `FrameMailbox`, and one named `veyra-media-engine` thread. The worker in `src/video/src/worker.rs` owns `Decoder`; dropping/replacing it releases FFmpeg, swscale, swresample, and ALSA resources. GPUI never receives native decoder or device pointers. The mailbox is latest-wins: publishing a new frame replaces an older unpresented frame; GPUI similarly replaces its prior `RenderImage`. `PresentationClock` in `src/video/src/rendering/decoder.rs` applies decoded PTS values in stream time-base seconds before a frame is published, so packet decode speed does not determine playback speed.
 
 The architecture is intentionally simple, but timing synchronization, bounded queues, and a formal playback state machine remain incomplete.

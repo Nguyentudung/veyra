@@ -1,0 +1,10 @@
+[package]
+name = "xattr"
+version = "0.2.3"
+edition = "2018"
+license = "MIT OR Apache-2.0"
+description = "Local compatibility patch for GPUI's xattr dependency"
+publish = false
+
+[dependencies]
+libc = "0.2"

@@ -3,15 +3,14 @@ members = [
     "src/app", "src/cache", "src/playback", "src/playlist", "src/scripting",
     "src/statistics", "src/ui", "src/utils", "src/video",
 ]
-exclude = ["third_party/rune", "third_party/rune/**"]
 resolver = "2"
 
 [package]
 name = "veyra"
-version = "0.0.24"
+version = "0.0.25"
 edition = "2024"
 license = "Apache-2.0"
-description = "A focused native desktop media player built with Rust and Rune"
+description = "A focused native desktop media player built with Rust and GPUI"
 
 [dependencies]
 veyra-app = { path = "src/app" }
@@ -19,10 +18,10 @@ veyra-app = { path = "src/app" }
 [dev-dependencies]
 
 [patch.crates-io]
-winit = { path = "third_party/rune/vendor/winit" }
-parley_engine = { path = "third_party/rune/vendor/parley_engine" }
-accesskit_windows = { path = "third_party/rune/vendor/accesskit_windows" }
-accesskit_macos = { path = "third_party/rune/vendor/accesskit_macos" }
+# GPUI's transitive tar implementation currently pins xattr 0.2.3. That
+# release aliases Linux's ENODATA as libc::ENOATTR, a symbol libc no longer
+# exports on Linux. Keep a tiny, API-compatible Linux patch in-tree.
+xattr = { path = "third_party/gpui/xattr" }
 
 [profile.release]
 opt-level = "s"

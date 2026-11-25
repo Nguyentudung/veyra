@@ -10,8 +10,8 @@ use super::{ColorInfo, Format};
 use std::{
     any::Any,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, OnceLock, PoisonError, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -107,17 +107,15 @@ impl CompositorDiagnostics {
     }
 
     fn add_duration(&self, target: &AtomicU64, elapsed: Duration) {
-        target.fetch_add(elapsed.as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+        target.fetch_add(
+            elapsed.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Returns a counter snapshot at most once per approximate second.
     pub fn take_interval(&self) -> Option<CompositorInterval> {
-        let now_ns = self
-            .0
-            .started
-            .elapsed()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+        let now_ns = self.0.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let previous = self.0.last_report_ns.load(Ordering::Relaxed);
         if now_ns.saturating_sub(previous) < DIAGNOSTIC_INTERVAL.as_nanos() as u64
             || self
@@ -193,6 +191,26 @@ pub struct GpuFrame {
 /// compositor, avoiding an intermediate producer-side RGB render pass.
 pub struct GpuVideoFrame {
     pub planes: [wgpu::TextureView; 2],
+    pub size_px: [u32; 2],
+    pub format: Format,
+    pub color: ColorInfo,
+    pub generation: u64,
+    /// Identifies a producer pool generation and slot for Rune's bind cache.
+    pub pool_id: u64,
+    pub slot: u32,
+    /// Producer-defined RAII lease. As for [`GpuFrame`], its drop must not
+    /// make wgpu calls because it can run in a completion callback.
+    pub lease: Arc<dyn Any + Send + Sync>,
+}
+
+/// A three-plane YUV420P picture produced on Rune's device and queue.
+///
+/// Plane 0 is `R8Unorm` luma at `size_px`; planes 1 and 2 are separate
+/// `R8Unorm` Cb and Cr planes at half resolution. Keeping chroma planar lets
+/// a producer upload decoded YUV420P directly instead of first interleaving
+/// it on the CPU solely for the compositor.
+pub struct GpuPlanarVideoFrame {
+    pub planes: [wgpu::TextureView; 3],
     pub size_px: [u32; 2],
     pub format: Format,
     pub color: ColorInfo,

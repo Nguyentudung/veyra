@@ -28,7 +28,7 @@ from typing import Any, Callable
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MEDIA = REPOSITORY_ROOT / "video_test" / "test_02.mp4"
+DEFAULT_MEDIA = REPOSITORY_ROOT / "video_test" / "test_03.mp4"
 DEFAULT_VEYRA_BINARY = REPOSITORY_ROOT / "target" / "release" / "veyra"
 DEFAULT_OUTPUT = REPOSITORY_ROOT / "log" / "veyra-vs-mpv.json"
 PROC_STAT_CLOCK_TICKS = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
@@ -98,8 +98,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--veyra-renderer",
-        default="gpu-video",
-        choices=("gpu-video", "gpu-native", "software", "vulkan-readback"),
+        default="software",
+        choices=("software", "vulkan-readback"),
         help="Veyra renderer passed through VEYRA_VIDEO_RENDERER",
     )
     parser.add_argument(
@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=("auto", "frame", "slice"),
         help="VEYRA_VIDEO_THREAD_MODE value",
+    )
+    parser.add_argument(
+        "--veyra-yuv420p-upload",
+        choices=("planar", "interleaved"),
+        default="planar",
+        help="legacy option retained for older result files; ignored by the GPUI renderer",
     )
     parser.add_argument(
         "--mpv-hwdec",
@@ -870,6 +876,7 @@ def run_veyra(
             "VEYRA_VIDEO_RENDERER": args.veyra_renderer,
             "VEYRA_VIDEO_THREADS": args.veyra_threads,
             "VEYRA_VIDEO_THREAD_MODE": args.veyra_thread_mode,
+            "VEYRA_YUV420P_UPLOAD": args.veyra_yuv420p_upload,
             "VEYRA_BENCHMARK_READY_FILE": str(ready_path),
             "VEYRA_BENCHMARK_METRICS_FILE": str(playback_metrics_path),
         }
@@ -1062,7 +1069,7 @@ def print_summary(summaries: dict[str, dict[str, Any]], *, headless: bool) -> No
     for player in ("veyra", "mpv"):
         playback = summaries[player].get("playback_metrics", {})
         if player == "veyra":
-            pipeline_rate = f"NativeSurface handoff {median(playback, 'delivery_fps')}"
+            pipeline_rate = f"GPUI frame handoff {median(playback, 'delivery_fps')}"
             drops = f"undelivered {median(playback, 'frame_drop_count')}"
         else:
             pipeline_rate = f"source admission est. {median(playback, 'source_frame_admission_fps_estimate')}"
@@ -1171,6 +1178,7 @@ def main() -> int:
             "veyra_window_backend": os.environ.get("WINIT_UNIX_BACKEND", "auto"),
             "veyra_threads": args.veyra_threads,
             "veyra_thread_mode": args.veyra_thread_mode,
+            "veyra_yuv420p_upload": args.veyra_yuv420p_upload,
             "mpv_hwdec": args.mpv_hwdec,
             "mpv_video_sync": args.mpv_video_sync,
             "execution_mode": "headless_diagnostic" if args.headless else "desktop_end_to_end",

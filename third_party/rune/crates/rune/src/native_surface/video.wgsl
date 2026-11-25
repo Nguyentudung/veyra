@@ -5,7 +5,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var plane0: texture_2d<f32>;
 @group(0) @binding(2) var plane1: texture_2d<f32>;
-@group(0) @binding(3) var filtering: sampler;
+@group(0) @binding(3) var plane2: texture_2d<f32>;
+@group(0) @binding(4) var filtering: sampler;
 struct Out { @builtin(position) pos: vec4<f32> };
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> Out {
     let corner = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
@@ -23,7 +24,8 @@ fn convert(a: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     if u.color.x < 0.5 { return vec4<f32>(linear(a.rgb) * a.a, a.a); }
     var y = a.r;
     var c = uv - vec2<f32>(128.0 / 255.0);
-    if u.color.x < 1.5 { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }
+    let video_range = u.color.x < 1.5 || (u.color.x > 2.5 && u.color.x < 3.5);
+    if video_range { y = (y - 16.0 / 255.0) * (255.0 / 219.0); c *= 255.0 / 224.0; }
     var kr = 0.299; var kb = 0.114;
     if u.color.y > 0.5 { kr = 0.2126; kb = 0.0722; }
     let r = y + 2.0 * (1.0 - kr) * c.y;
@@ -31,8 +33,20 @@ fn convert(a: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
     let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
     return vec4<f32>(linear(vec3<f32>(r,g,b)), 1.0);
 }
+fn sample_chroma(uv: vec2<f32>) -> vec2<f32> {
+    if u.color.x > 2.5 {
+        return vec2<f32>(textureSampleLevel(plane1, filtering, uv, 0.0).r, textureSampleLevel(plane2, filtering, uv, 0.0).r);
+    }
+    return textureSampleLevel(plane1, filtering, uv, 0.0).rg;
+}
+fn load_chroma(texel: vec2<i32>) -> vec2<f32> {
+    if u.color.x > 2.5 {
+        return vec2<f32>(textureLoad(plane1, texel, 0).r, textureLoad(plane2, texel, 0).r);
+    }
+    return textureLoad(plane1, texel, 0).rg;
+}
 fn sample_linear(uv: vec2<f32>) -> vec4<f32> {
-    return convert(textureSampleLevel(plane0, filtering, uv, 0.0), textureSampleLevel(plane1, filtering, uv, 0.0).rg);
+    return convert(textureSampleLevel(plane0, filtering, uv, 0.0), sample_chroma(uv));
 }
 fn ramp(d: f32, width: f32) -> f32 {
     if width == 0.0 { return clamp(d + 0.5, 0.0, 1.0); }
@@ -56,7 +70,7 @@ fn ramp(d: f32, width: f32) -> f32 {
     if u.sampling.x > 0.5 {
         // Integer device-pixel origin + pixel-centre positions: no interpolation, even at Retina 2x.
         let texel = vec2<i32>(floor(buffer));
-        col = convert(textureLoad(plane0, texel, 0), textureLoad(plane1, texel / 2, 0).rg);
+        col = convert(textureLoad(plane0, texel, 0), load_chroma(texel / 2));
     } else {
         let ratio = u.sampling.yz / size;
         // Bounded area supersampling for large shrink ratios (up to 8x8 bilinear taps).

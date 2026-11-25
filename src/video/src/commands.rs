@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 pub enum Command {
     Open(PathBuf),
-    GpuContext(crate::GpuContext),
     Pause,
     Seek(f64),
     SeekTo(f64),

@@ -2,7 +2,7 @@
 
 ## Scope and result
 
-This report describes the implementation currently in the repository. Veyra uses one Rust worker thread around a custom FFmpeg/ALSA pipeline. Rune owns the UI and accepts direct GPU YUV frames where available, with CPU BGRA bytes as the software fallback. libmpv is installed on the host, but is not linked into Veyra and has not replaced the current engine.
+This report describes the implementation currently in the repository. Veyra uses one Rust worker thread around a custom FFmpeg/ALSA pipeline. GPUI owns the UI and presents the worker's CPU BGRA bytes as a `RenderImage`. libmpv is installed on the host, but is not linked into Veyra and has not replaced the current engine.
 
 The audit found two concrete audio configuration defects: libswresample always produced stereo S16 at 48 kHz, while ALSA was configured from the input frame rate and source channel count. This could play audio at the wrong speed and send a stereo buffer to a PCM configured for a different frame width. ALSA now uses the fixed 48 kHz, two-channel output format. PCM write failures are no longer ignored; recoverable errors use `snd_pcm_recover` and unrecoverable errors reach the worker error state. The audit also found that timeline drags were sending relative seeks based on a stale snapshot; timeline input now sends absolute targets.
 
@@ -15,12 +15,12 @@ Real media playback and A/V measurements were not available in this headless run
 3. `Decoder::open` calls `avformat_open_input` and `avformat_find_stream_info` in `decoder/demuxer.rs`, allocates one `AVPacket`, and calls `av_find_best_stream` for video in `decoder/codec.rs`.
 4. Codec parameters are copied with `avcodec_parameters_to_context`, then the codec is opened with `avcodec_open2`.
 5. The worker repeatedly calls `av_read_frame`. Video packets are sent with `avcodec_send_packet`; decoded frames are drained with `avcodec_receive_frame`.
-6. `src/video/src/rendering/gpu_video.rs` uploads Y/UV planes from YUV420P/NV12 frames to Rune's shared GPU context. `src/video/src/rendering/renderer.rs` lazily creates a `SwsContext` and calls `sws_scale` only for unsupported formats or GPU fallback.
+6. `src/video/src/rendering/renderer.rs` lazily creates a `SwsContext` and calls `sws_scale` to produce a portable BGRA frame for GPUI.
 7. `best_effort_timestamp`, falling back to `pts`, is converted using the selected stream time base. `PresentationClock` uses `Instant` and sleeps until the timestamp deadline before publishing.
 8. The worker stores one `VideoFrame` in `FrameMailbox`. Publishing replaces the previous unconsumed frame, so the queue is bounded at one and is latest-wins; source-frame wakes are coalesced.
-9. `ui::poll` takes the frame and calls `NativeSurface::push_gpu_video` for direct YUV frames or `push_bytes` for the fallback. Rune displays it with `SurfaceFit::Fit`.
+9. `ui::poll` takes the frame, builds a GPUI `RenderImage`, and displays it letterboxed in the video canvas.
 
-The default video path is CPU decode, direct YUV upload to Rune's compositor, then GPU presentation. It is not a hardware decoder or an FFmpeg-to-wgpu zero-copy path; the software fallback still performs CPU conversion and allocation.
+The default video path is CPU decode, BGRA conversion, GPUI image upload, then GPU presentation. It is not a hardware decoder or an FFmpeg-to-wgpu zero-copy path.
 
 ## Audio pipeline
 
@@ -50,7 +50,7 @@ The input-rate/output-rate mismatch was a confirmed cause of incorrect audio spe
 
 ```mermaid
 flowchart LR
-  UI[Main Rune UI thread] -->|mpsc Command| W[veyra-media-engine thread]
+  UI[Main GPUI UI thread] -->|mpsc Command| W[veyra-media-engine thread]
   W --> D[Demux + audio/video decode]
   D -->|blocking writei| A[ALSA default PCM]
   D -->|Mutex<Option<VideoFrame>> latest wins| F[Video frame slot]
@@ -62,7 +62,7 @@ flowchart LR
 
 ## Rendering implementation and bottlenecks
 
-Rune provides the window, native decorations, UI composition, backdrop blur and native surface presentation. Veyra submits `Format::Bgra` bytes through `NativeSurface::push_bytes`; this is a CPU byte surface API. The custom renderer allocates and fills a complete BGRA buffer per presented frame. The UI poll loop wakes approximately every 16 ms and takes at most the newest frame.
+GPUI provides the window, native decorations, UI composition, and image presentation. Veyra creates a `RenderImage` from each presented BGRA buffer. The custom renderer allocates and fills a complete BGRA buffer per presented frame. The UI poll loop wakes approximately every 16 ms and takes at most the newest frame.
 
 Likely cost centers from code inspection are the synchronous worker design, `sws_scale`, per-frame full-buffer allocation, one-frame replacement, blocking ALSA writes, and video-clock sleeps that prevent packet processing. These are identified implementation risks, not measured profiles. Hardware decoding is not configured. No real FPS, CPU, memory, dropped-frame, or display-refresh measurement was produced in this audit.
 
@@ -76,8 +76,7 @@ Likely cost centers from code inspection are the synchronous worker design, `sws
 | libswscale | 9.1.100 | CPU conversion to BGRA |
 | libswresample | 6.1.100 | Conversion to stereo S16 at 48 kHz |
 | ALSA | 1.2.15.3 | Default PCM configuration and blocking sample writes |
-| Rune | git revision `cca5df6` | Native window, layout, input, renderer and `NativeSurface` |
-| Rune Kit | git revision `cca5df6` | Buttons, icon buttons, palette and application controls |
+| GPUI | 0.2.2 | Native window, layout, input, renderer and image presentation |
 | bindgen | 0.72.1 | Build-time Rust bindings for FFmpeg and ALSA headers |
 | libc | 0.2.191 | Direct Rust dependency; no separate playback role in the audited path |
 
@@ -85,6 +84,6 @@ Likely cost centers from code inspection are the synchronous worker design, `sws
 
 ## Known limitations and libmpv migration
 
-The current engine is useful as a working prototype, but its single-worker and CPU-frame architecture is a poor long-term basis for mpv-level playback. libmpv would replace demuxing, codec selection, decode scheduling, buffering, audio output, clocks, seeking and playlist media state. Rune-specific UI, controls, playlist presentation, fullscreen action and state projection would remain.
+The current engine is useful as a working prototype, but its single-worker and CPU-frame architecture is a poor long-term basis for mpv-level playback. libmpv would replace demuxing, codec selection, decode scheduling, buffering, audio output, clocks, seeking and playlist media state. The GPUI interface, controls, playlist presentation, fullscreen action and state projection would remain.
 
-The host provides libmpv 0.41.0 and headers. Rune's public API inspected here accepts CPU byte frames; its internal wgpu device and texture resources are not exposed as a public external-texture bridge. A concrete OpenGL/EGL/FBO plus readback prototype is documented in `docs/libmpv-rendering.md`. The current engine must remain until that prototype renders real media inside Rune and its cost is measured.
+The host provides libmpv 0.41.0 and headers. The current GPUI frontend accepts CPU image data, so an external-texture bridge remains future work. A prior Rune-focused OpenGL/EGL/FBO investigation is retained in `docs/libmpv-rendering.md` as historical research. The current engine must remain until a prototype renders real media inside GPUI and its cost is measured.

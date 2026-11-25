@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
-use veyra_video::{Command, FrameMailbox, FrameWaker, GpuContext};
+use veyra_video::{Command, FrameMailbox, FrameWaker};
 pub use veyra_video::{FrameUpdate, Snapshot, VideoFrame};
 
 pub struct Engine {
@@ -61,11 +61,6 @@ impl Engine {
     }
     pub fn toggle_mute(&self) {
         let _ = self.tx.send(Command::Mute);
-    }
-    /// Supplies Rune's shared device/queue to the media worker. The worker
-    /// only consumes it when `VEYRA_VIDEO_RENDERER=gpu-native` is selected.
-    pub fn set_gpu_context(&self, context: GpuContext) {
-        let _ = self.tx.send(Command::GpuContext(context));
     }
     /// Makes the media worker wake the UI when a source-paced frame or a
     /// playback-state change is ready. The callback is coalesced by the

@@ -12,10 +12,15 @@ mod pipeline;
 pub(crate) mod place;
 #[cfg(test)]
 mod place_tests;
+#[cfg(test)]
+mod planar_tests;
 #[cfg(target_os = "windows")]
 pub mod windows;
 use crate::time::Instant;
-pub use gpu::{CompositorDiagnostics, CompositorInterval, GpuContext, GpuFrame, GpuVideoFrame};
+pub use gpu::{
+    CompositorDiagnostics, CompositorInterval, GpuContext, GpuFrame, GpuPlanarVideoFrame,
+    GpuVideoFrame,
+};
 pub(crate) use pipeline::Building;
 pub use pipeline::SurfaceRenderer;
 use std::sync::{Arc, Mutex};
@@ -69,6 +74,7 @@ pub(crate) enum Source {
     Bytes(ByteFrame),
     Gpu(Arc<GpuFrame>),
     GpuVideo(Arc<GpuVideoFrame>),
+    GpuPlanarVideo(Arc<GpuPlanarVideoFrame>),
     #[cfg(target_os = "macos")]
     PixelBuffer(macos::PixelBuffer),
     #[cfg(target_os = "windows")]
@@ -304,6 +310,41 @@ impl NativeSurface {
             color,
             orient: Orient::UP,
             source: Source::GpuVideo(Arc::new(frame)),
+        });
+        Ok(())
+    }
+    /// Publishes three external planar YUV420P textures rendered/uploaded on
+    /// the context from [`Self::gpu_context`]. Rune's normal video compositor
+    /// does YUV conversion, scaling and composition in its own render pass.
+    ///
+    /// This is separate from [`Self::push_gpu_video`] so existing NV12
+    /// producers retain their stable two-plane frame type.
+    pub fn push_gpu_planar_video(
+        &self,
+        frame: GpuPlanarVideoFrame,
+        frame_id: u64,
+    ) -> Result<(), String> {
+        if frame.size_px.contains(&0) || frame.size_px.iter().any(|v| *v > 16384) {
+            return Err("video size must be 1..16384".into());
+        }
+        if !matches!(frame.format, Format::Nv12Video | Format::Nv12Full) {
+            return Err("GPU planar video frame must use a YUV video/full-range format".into());
+        }
+        if self.gpu_generation() != Some(frame.generation) {
+            return Err(
+                "GPU planar video frame belongs to an unavailable or replaced device".into(),
+            );
+        }
+        let size = frame.size_px;
+        let format = frame.format;
+        let color = frame.color;
+        self.replace(Frame {
+            id: frame_id,
+            size,
+            format,
+            color,
+            orient: Orient::UP,
+            source: Source::GpuPlanarVideo(Arc::new(frame)),
         });
         Ok(())
     }

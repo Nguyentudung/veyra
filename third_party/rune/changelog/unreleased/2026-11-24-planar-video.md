@@ -1,0 +1,1 @@
+- **Native surfaces: GPU producers can publish planar YUV420P video without an intermediate CPU chroma interleave.** The compositor now accepts either NV12 or three separate Y, Cb and Cr texture views. Existing NV12 producers keep their two-plane path, while planar producers avoid retaining and filling a temporary interleaved chroma buffer.

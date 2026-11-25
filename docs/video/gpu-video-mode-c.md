@@ -15,16 +15,18 @@ select the legacy readback diagnostic renderer, and `gpu-native` selects Mode B.
 
 ```text
 FFmpeg AVFrame (NV12 or YUV420P)
-  -> queue.write_texture(Y + RG UV) on Rune's Queue
+  -> NV12: queue.write_texture(Y + RG UV) on Rune's Queue
+  -> YUV420P: queue.write_texture(Y + U + V) on Rune's Queue
   -> leased GPU-video mailbox frame
-  -> Rune's existing NV12 compositor (YUV conversion + scale + present)
+  -> Rune's video compositor (YUV conversion + scale + present)
 ```
 
 There is no Veyra command encoder, render pass, BGRA output texture, GPU
 readback, map/poll wait, or Veyra `queue.submit` on this path. NV12 uploads
-both planes directly. YUV420P interleaves U and V into one reusable CPU buffer
-for Rune's RG8 UV input; that buffer retains capacity and is not allocated per
-frame.
+both planes directly. YUV420P uploads separate U and V textures, avoiding the
+previous CPU interleave and retained scratch buffer. Both layouts hold the same
+1.5 bytes per source pixel in textures; YUV420P makes one additional queue
+write instead of the CPU copy.
 
 The implementation currently accepts 8-bit `YUV420P` and `NV12`. Other pixel
 formats or unsupported color metadata fall back to the software renderer rather
@@ -33,7 +35,8 @@ range and BT.601/BT.709 metadata are passed to Rune's existing video shader.
 
 ## Ownership and pressure
 
-Veyra owns a four-slot Y/UV texture pool. A frame carries an ownership-only
+Veyra starts with a three-slot texture pool and allocates a fourth slot only
+when all three are leased. A frame carries an ownership-only
 lease; Rune retains it through the compositor submission completion callback.
 When all slots are in use, Veyra drops the newest decoded frame and increments
 the `starved` diagnostic instead of waiting or growing a queue. Slot release
@@ -58,17 +61,17 @@ performance result: runtime measurements are required.
 
 ## Initial audit (not a benchmark)
 
-The Mode C producer allocates its Y/UV textures only when decoded dimensions
-change and reuses a four-slot pool. It calls `Queue::write_texture` for Y and
-UV, then publishes the frame; it does not create a command encoder, render
-pass, submission, `map_async`, or `Device::poll`. Rune imports the two views
-without uploading them again and retains the frame until its compositor
-submission completes.
+The Mode C producer allocates its plane textures when decoded dimensions or
+layout change and reuses three slots plus one lazy overflow slot. It calls
+`Queue::write_texture` for Y and chroma, then publishes the frame; it does not
+create a command encoder, render pass, submission, `map_async`, or
+`Device::poll`. Rune imports the views without uploading them again and retains
+the frame until its compositor submission completes.
 
 There are still small per-frame ownership allocations: the published frame and
 its RAII lease are each reference-counted heap objects. They are not a texture
 or pixel-buffer allocation, and no profile currently attributes a meaningful
-cost to them. The YUV420P UV interleave buffer is retained and reused.
+cost to them. No YUV420P interleave buffer is retained.
 
 ALSA is intentionally reset on every seek to prevent pre-seek PCM playing
 against the new video clock. The log now identifies this explicitly as
@@ -83,8 +86,8 @@ emitted by FFmpeg's AAC decoder, not by Vulkan or Mode C.
 | --- | --- | --- |
 | Renderer attachment | Passed | Runtime log reported `gpu-video renderer attached to Rune device`. |
 | Continuous presentation | Passed | 900 uploads completed with `starved=0`, pool id unchanged and two free slots. |
-| CPU upload reuse | Passed | YUV420P upload was 0.22–0.27 ms and UV interleave 0.07–0.09 ms; these are point samples, not averages. |
-| No producer readback/pass/submit | Passed by source audit | `NativeVideoRenderer::upload` only writes the two planes and publishes the frame. |
+| CPU upload reuse | Pending new measurement | YUV420P now uploads three planes directly; compare its extra queue write with the removed CPU interleave. |
+| No producer readback/pass/submit | Passed by source audit | `NativeVideoRenderer::upload` only writes source planes and publishes the frame. |
 | Lease lifetime | Passed by source audit | Rune retains `Imported` through its compositor completion callback before dropping the producer lease. |
 | Pause/resume, forward/back seek, EOS/restart | Not yet run as a controlled test | Must be tested interactively after the release build. |
 | Resolution/pixel-format transition | Not yet run as a controlled test | A size transition makes a new pool; unsupported formats intentionally fall back to software. |
@@ -103,7 +106,7 @@ numbers below describe only producer work.
 | Software | Not remeasured | Not remeasured | CPU conversion/upload path | Pending controlled run |
 | Vulkan readback | Not remeasured | Not remeasured | Has encoder, BGRA readback and polling | Pending controlled run |
 | Mode B | Not remeasured | Not remeasured | Has Veyra YUV-to-BGRA pass and an extra submit | Pending controlled run |
-| Mode C | Not measured in this document | 184 MB RSS / 122 MB PSS at 8 s on 1080×1920 H.264/AAC, 60 fps | 1.29 ms upload; 0.92 ms YUV420P interleave; no starvation after 300 uploads | One-host point sample; compare under the same protocol |
+| Mode C | Not remeasured after planar YUV420P | 184 MB RSS / 122 MB PSS at 8 s on 1080×1920 H.264/AAC, 60 fps | Historical sample predates direct planar chroma; remeasure before comparing | One-host point sample; compare under the same protocol |
 
 For each row, play the same file at the same window size for 60–120 seconds,
 wait for warm-up, and record only active playback. Capture `pidstat` and a

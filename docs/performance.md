@@ -26,17 +26,28 @@ playback does not fail solely because of a threading preference.
 ## Runtime paths
 
 - `gpu-video` remains the default renderer. It passes Y/UV data to Rune rather
-  than allocating and uploading a CPU BGRA frame for normal playback.
+  than allocating and uploading a CPU BGRA frame for normal playback. NV12
+  keeps its two-plane path; decoded YUV420P now uploads Y, Cb and Cr directly
+  to three GPU planes, avoiding the previous per-frame CPU Cb/Cr interleave
+  and its reusable 4K-scale scratch buffer.
+- Rune's GPU context is handed to the media worker on every UI wake, including
+  frame-only wakes. This lets a stream switch from its startup fallback to the
+  direct Y/UV path as soon as Rune finishes its first draw, rather than waiting
+  for the 250 ms controls refresh.
 - The software fallback no longer zero-fills an output frame just before
   libswscale overwrites it. It exposes that allocation only after FFmpeg has
   produced all visible rows.
-- The direct NV12 path keeps three leased texture pairs rather than four. It
-  still bounds producer/mailbox/GPU-sampler ownership, saves one full NV12
-  picture (about 3.1 MiB at 1080×1920), and safely drops the newest frame if a
-  severely stalled compositor exhausts the bounded pool.
+- The direct YUV path starts with three leased texture slots and allocates a
+  fourth only under contention. This saves one full YUV420 picture (about 3 MiB
+  at 1080×1920) when three suffice, while bounding memory and dropping a
+  frame if a stalled compositor exhausts all four slots.
 - Lua script directory scanning and runtime creation are deferred until a
   stream has its first frame (or one second for audio-only media). Explicit
   reload/console use starts it immediately.
+- Source-paced video sleeps for most of a frame interval, then spends up to
+  250 microseconds spinning for its deadline. This intentionally consumes a
+  small amount of extra CPU to reduce scheduler jitter without busy-waiting for
+  an entire frame.
 - Benchmark telemetry is opt-in and sampled at the existing 250 ms statistics
   cadence, so ordinary launches do not incur file-writing work.
 

@@ -7,6 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Sleeping until a presentation deadline can overshoot by around a scheduler
+// tick. Spend a deliberately small CPU tail to land source-paced frames more
+// consistently, without busy-waiting through an entire frame interval.
+const PRESENTATION_SPIN_TAIL: Duration = Duration::from_micros(250);
+
 pub(crate) struct PresentationClock {
     started_at: Option<Instant>,
     first_pts: Option<f64>,
@@ -80,7 +85,12 @@ impl PresentationClock {
         let started_at = *self.started_at.get_or_insert(now);
         let target = started_at + Duration::from_secs_f64((pts - first_pts).max(0.0));
         if let Some(remaining) = target.checked_duration_since(now) {
-            thread::sleep(remaining);
+            if remaining > PRESENTATION_SPIN_TAIL {
+                thread::sleep(remaining - PRESENTATION_SPIN_TAIL);
+            }
+            while Instant::now() < target {
+                std::hint::spin_loop();
+            }
         }
     }
 

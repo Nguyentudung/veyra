@@ -3,10 +3,6 @@ use std::sync::{Arc, Mutex, mpsc};
 
 pub fn run(rx: mpsc::Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, frame: Arc<FrameMailbox>) {
     let mut decoder = None;
-    // Rune creates its device lazily. Keep the most recent published context
-    // so opening a file before (or after) the first UI frame has identical
-    // native-renderer behavior.
-    let mut gpu_context = None;
     let mut paused = false;
     loop {
         // There is no work to do while paused or without an open decoder.
@@ -17,14 +13,7 @@ pub fn run(rx: mpsc::Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, frame: A
                 Ok(command) => command,
                 Err(_) => return,
             };
-            if handle_command(
-                command,
-                &mut decoder,
-                &mut gpu_context,
-                &mut paused,
-                &snapshot,
-                &frame,
-            ) {
+            if handle_command(command, &mut decoder, &mut paused, &snapshot, &frame) {
                 return;
             }
             continue;
@@ -36,14 +25,7 @@ pub fn run(rx: mpsc::Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, frame: A
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => return,
             };
-            if handle_command(
-                command,
-                &mut decoder,
-                &mut gpu_context,
-                &mut paused,
-                &snapshot,
-                &frame,
-            ) {
+            if handle_command(command, &mut decoder, &mut paused, &snapshot, &frame) {
                 return;
             }
         }
@@ -76,7 +58,6 @@ pub fn run(rx: mpsc::Receiver<Command>, snapshot: Arc<Mutex<Snapshot>>, frame: A
 fn handle_command(
     command: Command,
     decoder: &mut Option<Decoder>,
-    gpu_context: &mut Option<crate::GpuContext>,
     paused: &mut bool,
     snapshot: &Arc<Mutex<Snapshot>>,
     frame: &Arc<FrameMailbox>,
@@ -88,7 +69,7 @@ fn handle_command(
             // retained until the next UI poll.
             frame.clear();
             *decoder = None;
-            match Decoder::open(&path, gpu_context.as_ref()) {
+            match Decoder::open(&path) {
                 Ok(new_decoder) => {
                     let duration = new_decoder.duration();
                     let metadata = new_decoder.metadata();
@@ -126,12 +107,6 @@ fn handle_command(
                 Err(error) => snapshot.lock().unwrap().error = Some(error),
             }
             frame.wake();
-        }
-        Command::GpuContext(context) => {
-            *gpu_context = Some(context.clone());
-            if let Some(decoder) = decoder.as_mut() {
-                decoder.set_gpu_context(context);
-            }
         }
         Command::Pause => {
             *paused = !*paused;
